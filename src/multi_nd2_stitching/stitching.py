@@ -104,6 +104,8 @@ class PositionAlignment:
             for file_number in self.start_names_dict[name]:
                 self.start_names_by_file[file_number].append(name)
 
+        self._manual_adjustments()
+
     def _init_sizes(self):
         self.nzs = tuple(f.sizes["Z"] for f in self.nd2_files)
 
@@ -153,7 +155,7 @@ class PositionAlignment:
                 else None
                 for i, n in enumerate(self.position_names)
             )
-        self.names_list = list(self.names.keys())
+        self.names_list = sorted(list(self.names.keys()))
 
     def _init_neighborhood(self):
         neighbors_x = []
@@ -244,6 +246,50 @@ class PositionAlignment:
             end1 = self.end_times[name1]
             self.neighborhoods_end_time.append(min(end0, end1))
 
+    def _manual_adjustments(self):
+        self.position_test = np.zeros((self.nt, len(self.positions)), dtype=bool)
+        self.neighborhoods_test = np.zeros(
+            (self.nt, len(self.neighborhoods)), dtype=bool
+        )
+        self.start_name_test = np.zeros_like(self.position_test)
+
+        for i, name in enumerate(self.names_list):
+            start = self.time_offsets[name]
+            stop = self.end_times[name]
+            self.position_test[start:stop, i] = True
+
+        for name, timepoints in self.config.ignore_timepoints.items():
+            i = self.names_list.index(name)
+            for t in timepoints:
+                self.position_test[t, i] = False
+
+        for k, (name_i, name_j, _) in enumerate(self.neighborhoods):
+            i = self.names_list.index(name_i)
+            j = self.names_list.index(name_j)
+            self.neighborhoods_test[:, k] = np.logical_and(
+                self.position_test[:, i], self.position_test[:, j]
+            )
+
+        for file_i, names in self.start_names_by_file.items():
+            if file_i == 0:
+                start = 0
+            else:
+                start = self.max_t_by_file[file_i - 1]
+            stop = self.max_t_by_file[file_i]
+            for name in names:
+                i = self.names_list.index(name)
+                self.start_name_test[start:stop, i] = True
+
+        self.start_names_dict = {
+            name: self.names_list.index(name) for name in self.start_names
+        }
+
+        for name, timepoints in self.config.start_names_manual.items():
+            i = self.names_list.index(name)
+            for t in timepoints:
+                self.start_name_test[t, i] = True
+            self.start_names_dict[name] = i
+
     def __del__(self):
         for nd2_file in self.nd2_files:
             nd2_file.close()
@@ -328,7 +374,7 @@ class PositionAlignment:
         if t1 is None:
             t1 = self.nt
 
-        n = len(self.start_names)
+        n = len(self.positions)
 
         if not self.loaded:
             self.offsets_time = np.zeros(
@@ -341,7 +387,7 @@ class PositionAlignment:
         prev_fft = {}
         current_start_time = 0
         for i, file in enumerate(self.config.files):
-            tmp_start_names = self.start_names_by_file[i]
+            # tmp_start_names = self.start_names_by_file[i]
             pool = open_handle_pool(file, workers)
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 for t_ in trange(self.nts[i]):
@@ -349,8 +395,9 @@ class PositionAlignment:
                     if not t0 < t < t1:
                         continue
                     frames = {}
-                    for start_name in tmp_start_names:
-                        s_ind = self.start_names.index(start_name)
+                    for start_name, s_ind in self.start_names_dict.items():
+                        if not self.start_name_test[t, s_ind]:
+                            continue
                         frame0 = self.read_vol(start_name, i, t_, pool, ex)
                         cur_fft = spfft.rfftn(frame0[slices], workers=workers_per_fft)
                         if start_name in prev_fft:
@@ -363,11 +410,9 @@ class PositionAlignment:
                         prev_fft[start_name] = cur_fft
                         frames[start_name] = frame0
 
-                    for k, start_time in enumerate(self.neighborhoods_start_time):
-                        end_time = self.neighborhoods_end_time[k]
-                        if not start_time <= t < end_time:
+                    for k, (name0, name1, axis) in enumerate(self.neighborhoods):
+                        if not self.neighborhoods_test[t, k]:
                             continue
-                        name0, name1, axis = self.neighborhoods[k]
                         tmp_frames = []
                         for tmp_name in (name0, name1):
                             try:
@@ -384,30 +429,32 @@ class PositionAlignment:
                         offset[axis] += self.shift_px
                         self.offsets_neighbors[t, k] = offset
 
-                if i + 1 < len(self.config.files):
-                    for start_name in self.start_names_by_file[i + 1]:
-                        if start_name in tmp_start_names:
-                            continue
-                        frame = self.read_vol(start_name, i, self.nts[i] - 1, pool, ex)
-                        prev_fft[start_name] = spfft.rfftn(
-                            frame[slices], workers=workers_per_fft
-                        )
+                    if t + 1 < self.nt:
+                        for start_name, s_ind in self.start_names_dict.items():
+                            if not self.start_name_test[t + 1, s_ind]:
+                                continue
+                            if self.start_name_test[t, s_ind]:
+                                continue
+                            frame = self.read_vol(start_name, i, t_, pool, ex)
+                            prev_fft[start_name] = spfft.rfftn(
+                                frame[slices], workers=workers_per_fft
+                            )
 
             current_start_time += self.nts[i]
             close_handle_pool(pool)
 
-        calced_start_times = [
-            int(np.where(np.any(self.offsets_neighbors[::1, i] != 0, axis=1))[0][0])
-            for i in range(self.offsets_neighbors.shape[1])
-        ]
-        calced_end_times = [
-            self.nt
-            - int(np.where(np.any(self.offsets_neighbors[::-1, i] != 0, axis=1))[0][0])
-            for i in range(self.offsets_neighbors.shape[1])
-        ]
+        # calced_start_times = [
+        #     int(np.where(np.any(self.offsets_neighbors[::1, i] != 0, axis=1))[0][0])
+        #     for i in range(self.offsets_neighbors.shape[1])
+        # ]
+        # calced_end_times = [
+        #     self.nt
+        #     - int(np.where(np.any(self.offsets_neighbors[::-1, i] != 0, axis=1))[0][0])
+        #     for i in range(self.offsets_neighbors.shape[1])
+        # ]
         self.save()
-        assert self.neighborhoods_start_time == calced_start_times
-        assert self.neighborhoods_end_time == calced_end_times
+        # assert self.neighborhoods_start_time == calced_start_times
+        # assert self.neighborhoods_end_time == calced_end_times
 
     def manual_realignment(self, workers_per_fft=-1):
         for start_name, times in self.config.manual_realignment_time.items():
@@ -429,14 +476,11 @@ class PositionAlignment:
         start_name = self.start_names_by_file[0][0]
         self.global_coordinates = {(0, start_name): np.zeros(3)}
 
-        file_i = 0
         for t in range(self.nt):
-            if t >= self.max_t_by_file[file_i]:
-                file_i += 1
-            start_names = self.start_names_by_file[file_i]
             if t > 0:  # für t=0 wird start_name bei 0,0,0 platziert
-                for start_name in start_names:
-                    s_ind = self.start_names.index(start_name)
+                for start_name, s_ind in self.start_names_dict.items():
+                    if not self.start_name_test[t, s_ind]:
+                        continue
                     self.global_coordinates[(t, start_name)] = (
                         self.offsets_time[t - 1, s_ind]
                         + self.global_coordinates[(t - 1, start_name)]
@@ -452,11 +496,7 @@ class PositionAlignment:
                 # Neighbors in die global_coordinates eingefüllt,
                 # wenn ein Neighbor vorhanden ist.
                 i, j, k = neighbors.pop()
-                if (
-                    not self.neighborhoods_start_time[k]
-                    <= t
-                    < self.neighborhoods_end_time[k]
-                ):
+                if not self.neighborhoods_test[t, k]:
                     continue
                 offset = self.offsets_neighbors[t, k]
                 if (t, i) in self.global_coordinates:
@@ -472,7 +512,7 @@ class PositionAlignment:
                     # werden sie wieder zu neighbors hinzugefügt
                     neighbors.insert(0, (i, j, k))
 
-    def blend(self, filepath=None, t0=-1, t1=None, workers=10):
+    def blend(self, filepath=None, t0=0, t1=None, workers=10):
         if t1 is None:
             t1 = self.nt
         try:
@@ -514,13 +554,13 @@ class PositionAlignment:
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 for t_ in trange(self.nts[i]):
                     t = t_ + current_start_time
-                    if not t0 < t < t1:
+                    if not t0 <= t < t1:
                         continue
                     accum[:] = 0
                     counts[:] = 0
                     inds[:] = False
-                    for name in self.names_list:
-                        if not self.time_offsets[name] <= t < self.end_times[name]:
+                    for name_i, name in enumerate(self.names_list):
+                        if not self.position_test[t, name_i]:
                             continue
                         frame = self.read_vol(name, i, t_, pool, ex)
 
@@ -539,11 +579,7 @@ class PositionAlignment:
                         weights_ = [weights_y, weights_x]
 
                         for k, (ii, jj, axis) in enumerate(self.neighborhoods):
-                            if (
-                                not self.neighborhoods_start_time[k]
-                                <= t
-                                < self.neighborhoods_end_time[k]
-                            ):
+                            if not self.neighborhoods_test[t, k]:
                                 continue
                             if ii == name:
                                 diff = (
