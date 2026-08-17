@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import yaml
 
@@ -54,8 +54,14 @@ class StitchingConfig:
     slices: Optional[Slices]
     realignment_slices: Optional[Slices]
     start_names: dict[str, list[int]]
-    ignore_timepoints: dict[str, list[int]]
-    start_names_manual: dict[str, list[int]]
+    ignore_timepoints: Optional[dict[str, list[int]]] = field(default_factory=dict)
+    start_names_manual: Optional[dict[str, list[int]]] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.ignore_timepoints is None:
+            self.ignore_timepoints = {}
+        if self.start_names_manual is None:
+            self.start_names_manual = {}
 
 
 def load_config(file):

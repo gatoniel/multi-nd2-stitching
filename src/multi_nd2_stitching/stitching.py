@@ -24,7 +24,7 @@ def get_position(position_names, names):
             else:
                 raise ValueError("non-unique position_names")
     if pos is None:
-        raise ValueError("position name not found", position_names)
+        raise ValueError(f"position name ({names}) not found in", position_names)
     return pos
 
 
