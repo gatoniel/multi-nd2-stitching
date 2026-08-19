@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from helpers import FakeReader
 
 from multi_nd2_stitching.compute import (
     Spectra,
@@ -10,8 +11,6 @@ from multi_nd2_stitching.compute import (
 )
 from multi_nd2_stitching.offsets import Crop, PairTask, TimeTask, VolumeRef
 from multi_nd2_stitching.store import Offset, OffsetStore
-
-from helpers import FakeReader
 
 
 def vol(seed=0, shape=(16, 64, 64)):

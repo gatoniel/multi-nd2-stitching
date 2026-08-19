@@ -119,6 +119,7 @@ def run_plan(
     spectra,
     workers: int = -1,
     concurrency: int = 1,
+    limit: int | None = None,
     progress=None,
 ) -> int:
     """Run only what is missing. Returns the number of tasks executed.
@@ -133,6 +134,8 @@ def run_plan(
     submission would defeat that.
     """
     pending = plan.pending(store)
+    if limit is not None:
+        pending = pending[:limit]
     if not pending:
         return 0
     if concurrency <= 1:

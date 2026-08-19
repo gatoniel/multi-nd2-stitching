@@ -18,7 +18,6 @@ from .config import clamp_z
 from .layout import Layout
 from .metadata import FileStamp, Metadata
 
-
 _AXIS_NAME = {0: "z", 1: "y", 2: "x"}
 
 
@@ -36,7 +35,7 @@ class Crop:
     x: tuple[int | None, int | None]
 
     @classmethod
-    def of(cls, slices, nz: int) -> "Crop":
+    def of(cls, slices, nz: int) -> Crop:
         z, y, x = clamp_z(slices, nz)
         return cls(z=(z.start, z.stop), y=(y.start, y.stop), x=(x.start, x.stop))
 
@@ -46,7 +45,7 @@ class Crop:
     def key(self):
         return [list(self.z), list(self.y), list(self.x)]
 
-    def free_axis(self, axis: int) -> "Crop":
+    def free_axis(self, axis: int) -> Crop:
         """Drop the restriction on one lateral axis.
 
         A neighbour correlation lives on the overlap strip at the tile edge
@@ -227,7 +226,7 @@ class Plan:
             if (task.t_to if isinstance(task, TimeTask) else task.t) == t
         )
 
-    def between(self, t0: int, t1: int) -> "Plan":
+    def between(self, t0: int, t1: int) -> Plan:
         """Restrict to a timepoint window, for 'why is t=21 bad'."""
         return Plan(
             time_tasks=tuple(x for x in self.time_tasks if t0 <= x.t_to < t1),
@@ -235,14 +234,14 @@ class Plan:
         )
 
 
-def _file_keys(meta: Metadata) -> tuple[str, ...]:
+def file_keys(meta: Metadata) -> tuple[str, ...]:
     return tuple(_digest(attrs.asdict(FileStamp.of(f.path))) for f in meta.files)
 
 
 def build_plan(layout: Layout, meta: Metadata, precision: str = "float64") -> Plan:
     """Enumerate every offset the config implies. Pure; touches no pixel data."""
     cfg = layout.config
-    fkeys = _file_keys(meta)
+    fkeys = file_keys(meta)
     crop = Crop.of(cfg.slices, layout.nz)
     realign_crop = Crop.of(cfg.realignment_slices, layout.nz)
 

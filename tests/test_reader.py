@@ -2,13 +2,12 @@ from collections import Counter
 
 import numpy as np
 import pytest
+from helpers import FakeReader, build, make_meta
 
 from multi_nd2_stitching.compute import Spectra, run_plan
 from multi_nd2_stitching.offsets import VolumeRef, build_plan
 from multi_nd2_stitching.reader import VolumeCache
 from multi_nd2_stitching.store import OffsetStore
-
-from helpers import FakeReader, build, make_meta
 
 
 def refs(n=3):

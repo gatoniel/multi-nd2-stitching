@@ -2,6 +2,7 @@ from collections import Counter
 
 import numpy as np
 import pytest
+from helpers import FakeReader, build, make_meta
 
 from multi_nd2_stitching.compute import (
     Spectra,
@@ -12,8 +13,6 @@ from multi_nd2_stitching.compute import (
 from multi_nd2_stitching.offsets import Crop, SpectrumRef, VolumeRef, build_plan
 from multi_nd2_stitching.reader import SpectrumCache
 from multi_nd2_stitching.store import OffsetStore
-
-from helpers import FakeReader, build, make_meta
 
 FULL = Crop((None, None), (None, None), (None, None))
 
@@ -83,7 +82,7 @@ def test_precision_is_part_of_the_key(cfg_dict, tmp_path):
     lay = build(cfg_dict, n_files=2, nt=5, paths=files)
     a = build_plan(lay, meta, precision="float64")
     b = build_plan(lay, meta, precision="float32")
-    assert set(t.key for t in a.tasks).isdisjoint(t.key for t in b.tasks)
+    assert {t.key for t in a.tasks}.isdisjoint(t.key for t in b.tasks)
 
 
 # --- the cache ----------------------------------------------------------------
@@ -95,7 +94,7 @@ def test_repeated_spectrum_is_transformed_once():
     reader = CountingReader(shape=(4, 8, 8))
     ref = _sref(0, 0)
     cache = SpectrumCache(reader, Counter({ref: 3}))
-    a, _ = cache.get(ref)
+    _a, _ = cache.get(ref)
     for _ in range(2):
         cache.get(ref)
     assert reader.loads[ref.volume] == 1
@@ -117,8 +116,8 @@ def test_different_crops_are_different_entries():
         VolumeRef("f0", 0, 0, 4), Crop((1, 3), (None, None), (None, None)), "float64"
     )
     cache = SpectrumCache(reader, Counter({a: 2, b: 2}))
-    fa, sa = cache.get(a)
-    fb, sb = cache.get(b)
+    _fa, sa = cache.get(a)
+    _fb, sb = cache.get(b)
     assert sa != sb
 
 

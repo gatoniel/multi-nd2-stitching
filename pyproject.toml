@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-stitch-validate = "multi_nd2_stitching.cli:main"
+stitch = "multi_nd2_stitching.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.8.4,<0.9.0"]

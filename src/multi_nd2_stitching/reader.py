@@ -12,6 +12,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from queue import Queue
+from typing import Self
 
 import numpy as np
 
@@ -47,7 +48,7 @@ class Nd2Reader:
         self._executor: ThreadPoolExecutor | None = None
 
     # --- lifecycle: explicit, so no __del__ runs at interpreter shutdown ---
-    def __enter__(self) -> "Nd2Reader":
+    def __enter__(self) -> Self:
         import nd2
 
         self._stack = ExitStack()
