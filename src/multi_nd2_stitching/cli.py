@@ -192,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--precision",
             choices=("float32", "float64"),
-            default="float64",
+            default="float32",
             help="float32 is ~2x faster and halves memory; it is part "
             "of the cache key, so switching recomputes",
         )
