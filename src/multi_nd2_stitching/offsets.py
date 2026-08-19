@@ -19,6 +19,9 @@ from .layout import Layout
 from .metadata import FileStamp, Metadata
 
 
+_AXIS_NAME = {0: "z", 1: "y", 2: "x"}
+
+
 def _digest(payload) -> str:
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
@@ -33,7 +36,7 @@ class Crop:
     x: tuple[int | None, int | None]
 
     @classmethod
-    def of(cls, slices, nz: int) -> Crop:
+    def of(cls, slices, nz: int) -> "Crop":
         z, y, x = clamp_z(slices, nz)
         return cls(z=(z.start, z.stop), y=(y.start, y.stop), x=(x.start, x.stop))
 
@@ -42,6 +45,16 @@ class Crop:
 
     def key(self):
         return [list(self.z), list(self.y), list(self.x)]
+
+    def free_axis(self, axis: int) -> "Crop":
+        """Drop the restriction on one lateral axis.
+
+        A neighbour correlation lives on the overlap strip at the tile edge
+        along `axis`; cropping there removes exactly the signal it needs.
+        The z restriction and the *other* lateral axis still apply -- those
+        cut planes and rows that are bad in both tiles alike.
+        """
+        return attrs.evolve(self, **{_AXIS_NAME[axis]: (None, None)})
 
 
 @attrs.frozen
@@ -58,6 +71,23 @@ class VolumeRef:
 
 
 @attrs.frozen
+class SpectrumRef:
+    """One rfftn input, identified exactly.
+
+    A time task feeds the whole cropped volume; a pair task feeds the overlap
+    strip, which differs depending on whether the tile is the parent or the
+    child of the pair -- so `axis`/`side`/`shift_px` are part of the identity.
+    """
+
+    volume: VolumeRef
+    crop: Crop
+    precision: str
+    axis: int | None = None
+    side: str | None = None
+    shift_px: int = 0
+
+
+@attrs.frozen
 class TimeTask:
     """Drift of one anchor tile between two consecutive global timepoints."""
 
@@ -67,13 +97,22 @@ class TimeTask:
     src: VolumeRef
     dst: VolumeRef
     crop: Crop
+    precision: str = "float64"
     realign: bool = False
 
     kind = "time"
 
     @property
     def key(self) -> str:
-        return _digest(["time", self.src.key(), self.dst.key(), self.crop.key()])
+        return _digest(
+            ["time", self.src.key(), self.dst.key(), self.crop.key(), self.precision]
+        )
+
+    def spectrum_refs(self) -> tuple[SpectrumRef, SpectrumRef]:
+        return (
+            SpectrumRef(self.src, self.crop, self.precision),
+            SpectrumRef(self.dst, self.crop, self.precision),
+        )
 
     def describe(self) -> str:
         tag = " (realign)" if self.realign else ""
@@ -92,6 +131,7 @@ class PairTask:
     dst: VolumeRef
     crop: Crop
     shift_px: int
+    precision: str = "float64"
 
     kind = "pair"
 
@@ -105,7 +145,18 @@ class PairTask:
                 self.axis,
                 self.shift_px,
                 self.crop.key(),
+                self.precision,
             ]
+        )
+
+    def spectrum_refs(self) -> tuple[SpectrumRef, SpectrumRef]:
+        return (
+            SpectrumRef(
+                self.src, self.crop, self.precision, self.axis, "parent", self.shift_px
+            ),
+            SpectrumRef(
+                self.dst, self.crop, self.precision, self.axis, "child", self.shift_px
+            ),
         )
 
     def describe(self) -> str:
@@ -119,7 +170,51 @@ class Plan:
 
     @property
     def tasks(self) -> tuple:
-        return self.time_tasks + self.pair_tasks
+        """Every task, ordered by timepoint.
+
+        Ordering is not cosmetic: a volume is needed by the pair tasks at t and
+        by the time tasks at t and t+1. Grouping by timepoint bounds the working
+        set at roughly two timepoints, which is what makes VolumeCache viable.
+        Running all time tasks before all pair tasks would evict and re-read
+        every volume twice.
+        """
+        return tuple(
+            sorted(
+                self.time_tasks + self.pair_tasks,
+                key=lambda x: (
+                    x.t_to if isinstance(x, TimeTask) else x.t,
+                    0 if isinstance(x, TimeTask) else 1,
+                ),
+            )
+        )
+
+    def spectrum_uses(self):
+        """How many times each rfftn result is needed.
+
+        Time tasks are where this pays: an anchor's spectrum at t is the `dst`
+        of the (t-1 -> t) task and the `src` of the (t -> t+1) one, so caching
+        halves the transforms. Pair spectra are almost always single-use,
+        because a tile is parent to one neighbour and child to another --
+        different strips, different transforms. The counter sorts that out
+        without anyone having to special-case it.
+        """
+        from collections import Counter
+
+        c = Counter()
+        for task in self.tasks:
+            for ref in task.spectrum_refs():
+                c[ref] += 1
+        return c
+
+    def volume_uses(self):
+        """How many times each volume is needed. Drives the reader's eviction."""
+        from collections import Counter
+
+        c = Counter()
+        for task in self.tasks:
+            c[task.src] += 1
+            c[task.dst] += 1
+        return c
 
     def pending(self, store) -> tuple:
         """The whole point: what still has to be run."""
@@ -132,7 +227,7 @@ class Plan:
             if (task.t_to if isinstance(task, TimeTask) else task.t) == t
         )
 
-    def between(self, t0: int, t1: int) -> Plan:
+    def between(self, t0: int, t1: int) -> "Plan":
         """Restrict to a timepoint window, for 'why is t=21 bad'."""
         return Plan(
             time_tasks=tuple(x for x in self.time_tasks if t0 <= x.t_to < t1),
@@ -144,7 +239,7 @@ def _file_keys(meta: Metadata) -> tuple[str, ...]:
     return tuple(_digest(attrs.asdict(FileStamp.of(f.path))) for f in meta.files)
 
 
-def build_plan(layout: Layout, meta: Metadata) -> Plan:
+def build_plan(layout: Layout, meta: Metadata, precision: str = "float64") -> Plan:
     """Enumerate every offset the config implies. Pure; touches no pixel data."""
     cfg = layout.config
     fkeys = _file_keys(meta)
@@ -172,6 +267,7 @@ def build_plan(layout: Layout, meta: Metadata) -> Plan:
                     src=ref(name, t - 1),
                     dst=ref(name, t),
                     crop=realign_crop if realign else crop,
+                    precision=precision,
                     realign=realign,
                 )
             )
@@ -187,8 +283,9 @@ def build_plan(layout: Layout, meta: Metadata) -> Plan:
                     t=t,
                     src=ref(p.a, t),
                     dst=ref(p.b, t),
-                    crop=crop,
+                    crop=crop.free_axis(p.axis),
                     shift_px=layout.shift_px,
+                    precision=precision,
                 )
             )
 

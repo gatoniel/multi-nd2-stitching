@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
-from helpers import FakeReader
 
 from multi_nd2_stitching.compute import (
+    Spectra,
     crop_for_alignment,
     fft_translation_3d,
     run_plan,
@@ -10,6 +10,8 @@ from multi_nd2_stitching.compute import (
 )
 from multi_nd2_stitching.offsets import Crop, PairTask, TimeTask, VolumeRef
 from multi_nd2_stitching.store import Offset, OffsetStore
+
+from helpers import FakeReader
 
 
 def vol(seed=0, shape=(16, 64, 64)):
@@ -58,7 +60,7 @@ def test_time_task_recovers_drift():
         dst=dst,
         crop=Crop((None, None), (None, None), (None, None)),
     )
-    assert run_task(task, reader) == Offset(0, -3, 2)
+    assert run_task(task, Spectra(reader)) == Offset(0, -3, 2)
 
 
 @pytest.mark.parametrize("extra", [0, 3, -4])
@@ -80,7 +82,7 @@ def test_pair_task_total_offset(extra):
         crop=Crop((None, None), (None, None), (None, None)),
         shift_px=20,
     )
-    out = run_task(task, reader)
+    out = run_task(task, Spectra(reader))
     assert (out.dz, out.dy, out.dx) == (0, 0, 20 + extra)
 
 
@@ -95,13 +97,13 @@ def test_crop_is_applied_before_correlation():
         dst=dst,
         crop=Crop((2, 10), (None, None), (None, None)),
     )
-    out = run_task(task, reader)
+    out = run_task(task, Spectra(reader))
     assert out.dy == -4  # y shift still recovered from the z-cropped stack
 
 
 def test_unknown_task_type_is_loud():
     with pytest.raises(TypeError):
-        run_task(object(), FakeReader())
+        run_task(object(), Spectra(FakeReader()))
 
 
 # --- run_plan -----------------------------------------------------------------
@@ -134,16 +136,16 @@ def _tasks(n):
 def test_run_plan_runs_everything_once(tmp_path):
     plan = TinyPlan(_tasks(3))
     store = OffsetStore(tmp_path / "off.jsonl")
-    assert run_plan(plan, store, FakeReader()) == 3
+    assert run_plan(plan, store, Spectra(FakeReader())) == 3
     assert len(store) == 3
 
 
 def test_run_plan_is_a_noop_the_second_time(tmp_path):
     plan = TinyPlan(_tasks(3))
     store = OffsetStore(tmp_path / "off.jsonl")
-    run_plan(plan, store, FakeReader())
+    run_plan(plan, store, Spectra(FakeReader()))
     reader = FakeReader()
-    assert run_plan(plan, store, reader) == 0
+    assert run_plan(plan, store, Spectra(reader)) == 0
     assert reader.reads == [], "a cached task must not touch the reader"
 
 
@@ -153,7 +155,7 @@ def test_run_plan_resumes_after_an_interruption(tmp_path):
     store = OffsetStore(path)
     for task in plan.tasks[:2]:
         store.put(task, Offset(0, 0, 0))
-    assert run_plan(plan, OffsetStore(path), FakeReader()) == 3
+    assert run_plan(plan, OffsetStore(path), Spectra(FakeReader())) == 3
 
 
 def test_results_survive_a_crash_mid_run(tmp_path):
@@ -169,6 +171,6 @@ def test_results_survive_a_crash_mid_run(tmp_path):
             return super().read(ref)
 
     with pytest.raises(KeyboardInterrupt):
-        run_plan(TinyPlan(tasks), store, Boom())
+        run_plan(TinyPlan(tasks), store, Spectra(Boom()))
     # task 0 reads local_t 0 and 1; task 1 reads local_t 2 and dies.
     assert len(OffsetStore(path)) == 1
