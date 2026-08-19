@@ -182,6 +182,140 @@ def cmd_offsets(args) -> int:
     return 0
 
 
+def cmd_blend(args) -> int:
+    from .blend import (
+        BlendLog,
+        CanvasGeometry,
+        CanvasMismatch,
+        blend,
+        resolve_geometry,
+    )
+    from .coordinates import MissingOffsets, build_coordinates
+    from .reader import Nd2Reader
+
+    ws, cfg, meta, layout = _prepare(args, need_metadata=True)
+    plan = build_plan(layout, meta, precision=args.precision)
+    store = OffsetStore(ws.offsets)
+
+    try:
+        coords = build_coordinates(layout, plan, store)
+    except MissingOffsets as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    output = Path(args.output).expanduser() if args.output else ws.canvas
+    tile_shape = (layout.nz, layout.ny, layout.nx)
+    t0 = 0 if args.between is None else args.between[0]
+    t1 = layout.nt if args.between is None else args.between[1]
+
+    if args.recreate and output.exists():
+        import shutil
+
+        shutil.rmtree(output, ignore_errors=True)
+        for suffix in (".blended", ".geometry.json"):
+            Path(str(output) + suffix).unlink(missing_ok=True)
+
+    try:
+        geometry, is_new = resolve_geometry(
+            output,
+            coords,
+            tile_shape,
+            layout.nt,
+            args.dtype,
+            t0,
+            t1,
+            recreate=args.recreate,
+        )
+    except CanvasMismatch as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    log = BlendLog(None if args.no_log else Path(str(output) + ".blended"))
+    todo = [
+        t
+        for t in range(t0, t1)
+        if args.force or not log.is_done(t, log.key(t, coords, geometry))
+    ]
+
+    print(f"output     {output}")
+    print(
+        f"canvas     {tuple(int(v) for v in geometry.shape)}  "
+        f"origin={geometry.origin}  dtype={geometry.dtype}"
+        f"{'  (new)' if is_new else '  (existing frame)'}"
+    )
+    slack = geometry.slack(coords, tile_shape, layout.nt)
+    if any(v > 0 for v in slack):
+        need = CanvasGeometry.required(coords, tile_shape, layout.nt, args.dtype)
+        print(
+            f"slack      {slack} larger than the current coordinates need "
+            f"{need.spatial}; delete the canvas and re-run to shrink it"
+        )
+    print(f"timepoints {t1 - t0} in range, {len(todo)} to write")
+    if not todo:
+        print("nothing to do")
+        return 0
+    if args.dry_run:
+        rewrites = [t for t in todo if log.written(t)]
+        print(
+            f"  would write t={todo[0]}..{todo[-1]}"
+            f"{f' ({len(rewrites)} overwriting existing data)' if rewrites else ''}"
+        )
+        return 0
+
+    refs = {}
+    for t in range(t0, t1):
+        for name in layout.tiles_at(t):
+            if name in coords.at(t):
+                refs[(t, name)] = _volume_ref(layout, meta, name, t)
+
+    progress = None
+    if not args.no_progress:
+        try:
+            from tqdm import tqdm
+
+            progress = lambda xs: tqdm(xs, unit="t")
+        except ImportError:
+            pass
+
+    with Nd2Reader(
+        cfg.files,
+        file_keys(meta),
+        nz=layout.nz,
+        ny=layout.ny,
+        nx=layout.nx,
+        threads=args.read_threads,
+    ) as reader:
+        try:
+            n = blend(
+                layout,
+                coords,
+                reader,
+                refs,
+                output,
+                log,
+                geometry,
+                t0=t0,
+                t1=t1,
+                force=args.force,
+                progress=progress,
+                attempts=args.attempts,
+            )
+        except CanvasMismatch as e:
+            print(str(e), file=sys.stderr)
+            return 1
+    print(f"wrote      {n} timepoint(s)")
+    return 0
+
+
+def _volume_ref(layout, meta, name: str, t: int):
+    from .offsets import VolumeRef
+
+    fkeys = file_keys(meta)
+    file_i, pos = layout.frame_index(name, t)
+    _, local_t = layout.locate(t)
+    return VolumeRef(fkeys[file_i], pos, local_t, layout.nz)
+
+
 # --- wiring -------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="stitch")
@@ -192,7 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--precision",
             choices=("float32", "float64"),
-            default="float32",
+            default="float64",
             help="float32 is ~2x faster and halves memory; it is part "
             "of the cache key, so switching recomputes",
         )
@@ -226,6 +360,41 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--dry-run", action="store_true")
     o.add_argument("--no-progress", action="store_true")
     o.set_defaults(func=cmd_offsets)
+
+    b = common(sub.add_parser("blend", help="composite tiles onto a zarr canvas"))
+    b.add_argument(
+        "--output",
+        type=Path,
+        help="where to write the canvas; defaults to <workspace>/canvas.zarr. "
+        "Point this at local disk if the share is unreliable.",
+    )
+    b.add_argument("--between", type=int, nargs=2, metavar=("T0", "T1"))
+    b.add_argument("--dtype", default="uint16")
+    b.add_argument(
+        "--recreate",
+        action="store_true",
+        help="delete the canvas and start from a fresh, tight extent",
+    )
+    b.add_argument(
+        "--force",
+        action="store_true",
+        help="rewrite timepoints already recorded as done",
+    )
+    b.add_argument(
+        "--attempts",
+        type=int,
+        default=4,
+        help="retries per timepoint before giving up on a flaky mount",
+    )
+    b.add_argument(
+        "--no-log",
+        action="store_true",
+        help="do not record progress (every run rewrites everything)",
+    )
+    b.add_argument("--read-threads", type=int, default=10)
+    b.add_argument("--dry-run", action="store_true")
+    b.add_argument("--no-progress", action="store_true")
+    b.set_defaults(func=cmd_blend)
     return ap
 
 

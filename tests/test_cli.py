@@ -33,7 +33,9 @@ def project(tmp_path, monkeypatch):
     cfg_path.write_text(yaml.safe_dump({**CFG, "files": files}))
 
     monkeypatch.setattr(
-        M, "read_metadata", lambda paths: make_meta(n_files=2, nt=4, paths=list(paths))
+        M,
+        "read_metadata",
+        lambda paths: make_meta(n_files=2, nt=4, nz=4, ny=8, nx=8, paths=list(paths)),
     )
 
     class StubReader(FakeReader):
@@ -104,7 +106,9 @@ def test_deep_validate_catches_an_unanchored_component(
     monkeypatch.setattr(
         M,
         "read_metadata",
-        lambda paths: make_meta(n_files=2, nt=4, tiles=tiles, paths=list(paths)),
+        lambda paths: make_meta(
+            n_files=2, nt=4, nz=4, ny=8, nx=8, tiles=tiles, paths=list(paths)
+        ),
     )
     project.write_text(
         yaml.safe_dump(
@@ -200,7 +204,7 @@ def test_metadata_cache_is_written_and_reused(project, monkeypatch):
 def test_changing_precision_invalidates(project, capsys):
     run("offsets", project, "--no-progress")
     capsys.readouterr()
-    run("status", project, "--precision", "float64")
+    run("status", project, "--precision", "float32")
     assert "cached     0" in capsys.readouterr().out
 
 
@@ -220,3 +224,125 @@ def test_show_names_both_kinds(project, capsys):
     out = capsys.readouterr().out
     assert "time tile_a 0->1" in out
     assert "pair" in out
+
+
+# --- blend --------------------------------------------------------------------
+def test_blend_refuses_without_offsets(project, capsys):
+    assert run("blend", project) == 1
+    assert "run `stitch offsets`" in capsys.readouterr().err
+
+
+def test_blend_writes_to_a_chosen_output(project, tmp_path, capsys):
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "elsewhere" / "canvas.zarr"
+    assert run("blend", project, "--output", out, "--no-progress") == 0
+    text = capsys.readouterr().out
+    assert str(out) in text
+    assert "wrote      8 timepoint(s)" in text
+    assert out.exists()
+
+
+def test_blend_defaults_into_the_workspace(project, capsys):
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    run("blend", project, "--no-progress")
+    assert Workspace.of(project).canvas.exists()
+
+
+def test_second_blend_is_a_noop(project, tmp_path, capsys):
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "canvas.zarr"
+    run("blend", project, "--output", out, "--no-progress")
+    capsys.readouterr()
+    assert run("blend", project, "--output", out, "--no-progress") == 0
+    assert "nothing to do" in capsys.readouterr().out
+
+
+def test_blend_between_then_resume(project, tmp_path, capsys):
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "canvas.zarr"
+    run("blend", project, "--output", out, "--between", 0, 3, "--no-progress")
+    assert "wrote      3" in capsys.readouterr().out
+    run("blend", project, "--output", out, "--no-progress")
+    assert "wrote      5" in capsys.readouterr().out
+
+
+def test_blend_dry_run_writes_nothing(project, tmp_path, capsys):
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "canvas.zarr"
+    assert run("blend", project, "--output", out, "--dry-run") == 0
+    assert "would write" in capsys.readouterr().out
+    assert not out.exists()
+
+
+def test_blend_keeps_an_oversized_canvas_and_says_so(project, tmp_path, capsys):
+    """The workflow: an over-wide canvas stays usable; you shrink it on purpose."""
+    import json
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "canvas.zarr"
+    run("blend", project, "--output", out, "--no-progress")
+    # simulate the real situation: the canvas was created wider than the
+    # coordinates now require (early offsets were wrong)
+    import shutil
+
+    geom = json.loads((tmp_path / "canvas.zarr.geometry.json").read_text())
+    geom["shape"][3] += 40
+    (tmp_path / "canvas.zarr.geometry.json").write_text(json.dumps(geom))
+    shutil.rmtree(out)
+    capsys.readouterr()
+    assert run("blend", project, "--output", out, "--no-progress", "--force") == 0
+    text = capsys.readouterr().out
+    assert "existing frame" in text
+    assert "slack" in text and "delete the canvas" in text
+
+
+def test_blend_refuses_when_the_sidecar_and_the_zarr_disagree(
+    project, tmp_path, capsys
+):
+    import json
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "canvas.zarr"
+    run("blend", project, "--output", out, "--no-progress")
+    geom = json.loads((tmp_path / "canvas.zarr.geometry.json").read_text())
+    geom["shape"][3] += 40
+    (tmp_path / "canvas.zarr.geometry.json").write_text(json.dumps(geom))
+    capsys.readouterr()
+    assert run("blend", project, "--output", out, "--no-progress", "--force") == 1
+    assert "but its geometry says" in capsys.readouterr().err
+
+
+def test_recreate_shrinks_back(project, tmp_path, capsys):
+    import json
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "canvas.zarr"
+    run("blend", project, "--output", out, "--no-progress")
+    tight = json.loads((tmp_path / "canvas.zarr.geometry.json").read_text())["shape"]
+    geom = json.loads((tmp_path / "canvas.zarr.geometry.json").read_text())
+    geom["shape"][3] += 40
+    (tmp_path / "canvas.zarr.geometry.json").write_text(json.dumps(geom))
+    capsys.readouterr()
+    run("blend", project, "--output", out, "--recreate", "--no-progress")
+    text = capsys.readouterr().out
+    assert "(new)" in text
+    assert (
+        json.loads((tmp_path / "canvas.zarr.geometry.json").read_text())["shape"]
+        == tight
+    )
+
+
+def test_blend_refuses_a_tile_that_no_longer_fits(project, tmp_path, capsys):
+    import json
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "canvas.zarr"
+    run("blend", project, "--output", out, "--no-progress")
+    geom = json.loads((tmp_path / "canvas.zarr.geometry.json").read_text())
+    geom["shape"][3] -= 4
+    (tmp_path / "canvas.zarr.geometry.json").write_text(json.dumps(geom))
+    capsys.readouterr()
+    assert run("blend", project, "--output", out, "--no-progress", "--force") == 1
+    assert "no longer fit" in capsys.readouterr().err
