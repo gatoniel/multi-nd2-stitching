@@ -6,10 +6,15 @@ layer below can be tested with hand-written metadata and no microscopy files.
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 
 import attrs
+import cattrs
 from cattrs.preconf.json import make_converter
+
+logger = logging.getLogger(__name__)
 
 
 @attrs.frozen
@@ -115,10 +120,10 @@ def load_metadata(paths, cache: Path | None = None) -> Metadata:
     if cache.exists():
         try:
             blob = converter.loads(cache.read_text(), MetadataCache)
-        except Exception:
+        except (json.JSONDecodeError, cattrs.errors.ClassValidationError):
             # Corrupt file, or a FileMeta field added since it was written.
             # A stale cache is never a reason to fail -- just re-read.
-            pass
+            logger.debug("ignoring unreadable metadata cache at %s", cache, exc_info=True)
         else:
             if blob.stamp == stamp:
                 return blob.metadata
