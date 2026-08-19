@@ -1,14 +1,16 @@
-import nd2
-import zarr
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
-from tqdm import trange, tqdm
-import scipy.fft as spfft
 import os
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
-from .config import load_config, get_slices
+from pathlib import Path
+from queue import Queue
+
+import nd2
+import numpy as np
+import scipy.fft as spfft
+import zarr
+from tqdm import tqdm, trange
+
+from .config import clamp_z, load_config
 
 
 def get_position_names(nd2_file):
@@ -121,7 +123,7 @@ class PositionAlignment:
         self.max_nz = max(self.nzs)
         self.min_nz = min(self.nzs)
         self.nts = tuple(
-            f.sizes["T"] if ("T" in f.sizes) else 1 for f in self.nd2_files
+            f.sizes.get("T", 1) for f in self.nd2_files
         )
         self.max_t_by_file = np.cumsum(self.nts)
         self.nt = sum(self.nts)
@@ -155,7 +157,7 @@ class PositionAlignment:
                 else None
                 for i, n in enumerate(self.position_names)
             )
-        self.names_list = sorted(list(self.names.keys()))
+        self.names_list = sorted(self.names.keys())
 
     def _init_neighborhood(self):
         neighbors_x = []
@@ -228,7 +230,7 @@ class PositionAlignment:
     def _init_imgs(self):
         self.time_offsets = {}
         self.end_times = {}
-        for name, inds in self.positions.items():
+        for name in self.positions:
             self.time_offsets[name] = (
                 sum(self.nts[: self.starts[name][0]]) + self.starts[name][1]
             )
@@ -311,9 +313,9 @@ class PositionAlignment:
                 start = file._seq_index_from_coords((local_time, pos, 0))
             else:
                 start = file._seq_index_from_coords((pos, 0))
-        except TypeError as e:
+        except TypeError:
             print(local_time, pos, 0, file, file.sizes)
-            raise e
+            raise
 
         arr = np.empty((self.min_nz, self.ny, self.nx), dtype=file.dtype)
 
@@ -370,7 +372,7 @@ class PositionAlignment:
         t1=None,
     ):
         if slices is None:
-            slices = get_slices(self.config.slices, self.min_nz)
+            slices = clamp_z(self.config.slices, self.min_nz)
         if t1 is None:
             t1 = self.nt
 
@@ -461,7 +463,7 @@ class PositionAlignment:
             s_ind = self.start_names.index(start_name)
 
             for i in tqdm(times):
-                slices = get_slices(self.config.realignment_slices, self.min_nz)
+                slices = clamp_z(self.config.realignment_slices, self.min_nz)
 
                 frame1 = self.read_vol_simple(i, start_name)[slices]
                 frame0 = self.read_vol_simple(i - 1, start_name)[slices]
@@ -619,10 +621,10 @@ class PositionAlignment:
                                 if np.any(inds[sl[1:]]):
                                     try:
                                         canvas[sl] = accum[sl[1:]].astype(dtype)
-                                    except ValueError as e:
+                                    except ValueError:
                                         print(canvas[sl].shape)
                                         print(accum[sl[1:]].shape)
-                                        raise e
+                                        raise
 
             current_start_time += self.nts[i]
             close_handle_pool(pool)
