@@ -200,7 +200,7 @@ def test_metadata_cache_is_written_and_reused(project, monkeypatch):
 def test_changing_precision_invalidates(project, capsys):
     run("offsets", project, "--no-progress")
     capsys.readouterr()
-    run("status", project, "--precision", "float32")
+    run("status", project, "--precision", "float64")
     assert "cached     0" in capsys.readouterr().out
 
 
