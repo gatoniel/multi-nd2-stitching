@@ -123,7 +123,9 @@ def load_metadata(paths, cache: Path | None = None) -> Metadata:
         except (json.JSONDecodeError, cattrs.errors.ClassValidationError):
             # Corrupt file, or a FileMeta field added since it was written.
             # A stale cache is never a reason to fail -- just re-read.
-            logger.debug("ignoring unreadable metadata cache at %s", cache, exc_info=True)
+            logger.debug(
+                "ignoring unreadable metadata cache at %s", cache, exc_info=True
+            )
         else:
             if blob.stamp == stamp:
                 return blob.metadata
