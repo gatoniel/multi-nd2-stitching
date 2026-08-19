@@ -1,0 +1,206 @@
+"""Geometry and timeline: a pure function of (config, metadata).
+
+Nothing here is expensive and nothing here is cached. It is rebuilt from scratch
+on every run, which is what makes the result depend only on the YAML.
+"""
+
+from __future__ import annotations
+
+from itertools import combinations
+
+import attrs
+import numpy as np
+
+from .config import StitchingConfig
+from .metadata import Metadata
+
+
+@attrs.frozen(order=True)
+class Pair:
+    """Two tiles that overlap along one axis. `axis` is 1 (y) or 2 (x) in zyx."""
+
+    a: str
+    b: str
+    axis: int
+
+
+@attrs.frozen
+class Tile:
+    name: str
+    aliases: tuple[str, ...]
+    first_t: int  # global timepoint it appears
+    last_t: int  # global timepoint it disappears, EXCLUSIVE
+    position: tuple[int | None, ...]  # position index per file, None where absent
+
+
+@attrs.define
+class Layout:
+    config: StitchingConfig
+    tiles: tuple[str, ...]
+    tile: dict[str, Tile]
+    pairs: tuple[Pair, ...]
+    nts: tuple[int, ...]
+    file_start: tuple[int, ...]  # global t at which each file begins
+    nt: int
+    nz: int  # min stack depth across files
+    ny: int
+    nx: int
+    shift_px: int
+    tile_alive: np.ndarray  # (nt, n_tiles) bool
+    pair_alive: np.ndarray  # (nt, n_pairs) bool
+    is_anchor: np.ndarray  # (nt, n_tiles) bool
+
+    # --- lookups ---------------------------------------------------------
+    def ti(self, name: str) -> int:
+        return self.tiles.index(name)
+
+    def locate(self, t: int) -> tuple[int, int]:
+        """Global timepoint -> (file index, timepoint within that file)."""
+        if not 0 <= t < self.nt:
+            raise IndexError(f"t={t} outside timeline 0..{self.nt - 1}")
+        file_i = int(np.searchsorted(self.file_start, t, side="right") - 1)
+        return file_i, t - self.file_start[file_i]
+
+    def tiles_at(self, t: int) -> list[str]:
+        return [n for i, n in enumerate(self.tiles) if self.tile_alive[t, i]]
+
+    def pairs_at(self, t: int) -> list[Pair]:
+        return [p for k, p in enumerate(self.pairs) if self.pair_alive[t, k]]
+
+    def anchors_at(self, t: int) -> list[str]:
+        return [n for i, n in enumerate(self.tiles) if self.is_anchor[t, i]]
+
+    def frame_index(self, name: str, t: int) -> tuple[int, int]:
+        """(file index, position index) for a tile at a global timepoint."""
+        file_i, _ = self.locate(t)
+        pos = self.tile[name].position[file_i]
+        if pos is None:
+            raise ValueError(f"'{name}' has no position in file {file_i} (t={t})")
+        return file_i, pos
+
+
+def _discover_pairs(
+    cfg: StitchingConfig, meta: Metadata, tile: dict[str, Tile]
+) -> tuple[Pair, ...]:
+    """Infer adjacency from stage coordinates, unioned over all files."""
+    lo = cfg.grid_spacing - cfg.grid_spacing_error
+    hi = cfg.grid_spacing + cfg.grid_spacing_error
+    tol = cfg.grid_spacing_error
+
+    found: set[Pair] = set()
+    for file_i, fm in enumerate(meta.files):
+        here = {
+            name: np.array(fm.stage_um[t.position[file_i]])
+            for name, t in tile.items()
+            if t.position[file_i] is not None
+        }
+        for n_i, n_j in combinations(sorted(here), 2):
+            dx, dy = here[n_i] - here[n_j]
+            if abs(dx) < tol:
+                if lo < dy < hi:
+                    found.add(Pair(n_i, n_j, 1))
+                elif -hi < dy < -lo:
+                    found.add(Pair(n_j, n_i, 1))
+            if abs(dy) < tol:
+                if lo < dx < hi:
+                    found.add(Pair(n_i, n_j, 2))
+                elif -hi < dx < -lo:
+                    found.add(Pair(n_j, n_i, 2))
+
+    pairs = list(found)
+    if cfg.flip_x:
+        pairs = [Pair(p.b, p.a, p.axis) if p.axis == 2 else p for p in pairs]
+    if cfg.flip_y:
+        pairs = [Pair(p.b, p.a, p.axis) if p.axis == 1 else p for p in pairs]
+    return tuple(sorted(pairs))
+
+
+def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
+    n_files = len(meta)
+    if n_files != cfg.n_files:
+        raise ValueError(f"config lists {cfg.n_files} files, metadata has {n_files}")
+
+    nys = {f.ny for f in meta.files}
+    nxs = {f.nx for f in meta.files}
+    if len(nys) != 1 or len(nxs) != 1:
+        raise ValueError(f"tile size differs across files: ny={nys}, nx={nxs}")
+
+    nts = meta.nts
+    file_start = tuple(int(s) for s in np.concatenate([[0], np.cumsum(nts)[:-1]]))
+    nt = int(sum(nts))
+
+    # --- tiles ------------------------------------------------------------
+    tiles = tuple(sorted(cfg.positions))
+    tile: dict[str, Tile] = {}
+    for name in tiles:
+        pos = cfg.positions[name]
+        names = (name, *(a for a in pos.aliases if a != name))
+        end_file = n_files if pos.end is None else pos.end
+        position = tuple(
+            meta[i].position_of(names) if pos.start[0] <= i < end_file else None
+            for i in range(n_files)
+        )
+        missing = [i for i in range(pos.start[0], end_file) if position[i] is None]
+        if missing:
+            raise ValueError(
+                f"'{name}' should be alive in files {pos.start[0]}..{end_file - 1} "
+                f"but no matching position exists in files {missing}"
+            )
+        tile[name] = Tile(
+            name=name,
+            aliases=names,
+            first_t=file_start[pos.start[0]] + pos.start[1],
+            last_t=nt
+            if pos.end is None
+            else file_start[end_file - 1] + nts[end_file - 1],
+            position=position,
+        )
+
+    pairs = _discover_pairs(cfg, meta, tile)
+
+    # --- masks ------------------------------------------------------------
+    tile_alive = np.zeros((nt, len(tiles)), dtype=bool)
+    is_anchor = np.zeros((nt, len(tiles)), dtype=bool)
+    for i, name in enumerate(tiles):
+        tile_alive[tile[name].first_t : tile[name].last_t, i] = True
+        for f in cfg.positions[name].reference_in_files:
+            is_anchor[file_start[f] : file_start[f] + nts[f], i] = True
+
+    # overrides, applied in this order: drops first, then anchors
+    for o in cfg.overrides:
+        for t in o.at:
+            for name in o.drop:
+                tile_alive[t, tiles.index(name)] = False
+                is_anchor[t, tiles.index(name)] = False
+            for name in o.anchor:
+                is_anchor[t, tiles.index(name)] = True
+    is_anchor &= tile_alive
+
+    pair_alive = np.zeros((nt, len(pairs)), dtype=bool)
+    for k, p in enumerate(pairs):
+        pair_alive[:, k] = (
+            tile_alive[:, tiles.index(p.a)] & tile_alive[:, tiles.index(p.b)]
+        )
+
+    shift_px = (
+        cfg.shift_px
+        if cfg.shift_px is not None
+        else int(cfg.grid_spacing / meta[0].voxel_x_um)
+    )
+
+    return Layout(
+        config=cfg,
+        tiles=tiles,
+        tile=tile,
+        pairs=pairs,
+        nts=nts,
+        file_start=file_start,
+        nt=nt,
+        nz=min(f.nz for f in meta.files),
+        ny=nys.pop(),
+        nx=nxs.pop(),
+        shift_px=shift_px,
+        tile_alive=tile_alive,
+        pair_alive=pair_alive,
+        is_anchor=is_anchor,
+    )
