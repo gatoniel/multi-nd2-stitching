@@ -1,0 +1,34 @@
+[project]
+name = "multi-nd2-stitching"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Niklas Breitenbach-Netter", email = "niknett@gmail.com" }
+]
+requires-python = ">=3.11.1"
+dependencies = [
+    "cattrs>=26.1.0",
+    "nd2>=0.11.3",
+    "numpy>=2.4.6",
+    "pyyaml>=6.0.3",
+    "scipy>=1.17.1",
+    "tqdm>=4.70.0",
+    "zarr>=3.1.6",
+]
+
+[project.scripts]
+stitch-validate = "multi_nd2_stitching.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
