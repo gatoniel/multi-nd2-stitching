@@ -122,9 +122,7 @@ class PositionAlignment:
 
         self.max_nz = max(self.nzs)
         self.min_nz = min(self.nzs)
-        self.nts = tuple(
-            f.sizes.get("T", 1) for f in self.nd2_files
-        )
+        self.nts = tuple(f.sizes.get("T", 1) for f in self.nd2_files)
         self.max_t_by_file = np.cumsum(self.nts)
         self.nt = sum(self.nts)
 
