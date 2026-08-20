@@ -733,7 +733,7 @@ def test_timings_are_recorded(scene, tmp_path):
     )
     d = timings.as_dict()
     assert d["total_s"] >= 0.0
-    assert {"read_s", "compose_s", "write_s", "total_s"} <= set(d)
+    assert {"read_s", "compose_s", "write_s", "total_s", "peak_mb"} <= set(d)
     # exactly one of the two slack keys, never both
     assert ("overlap_s" in d) != ("other_s" in d)
 
@@ -774,3 +774,45 @@ def test_a_write_failure_still_propagates_when_pipelined(scene, tmp_path):
             geom,
             pipeline=True,
         )
+
+
+# --- the weights cache must not grow without limit ----------------------------
+def test_weights_cache_is_bounded(scene):
+    """A ramp length is a measured tile separation; it drifts every timepoint,
+    so an unbounded cache accumulates 2 MB arrays for the whole run."""
+    from multi_nd2_stitching.blend import WEIGHTS_CACHE_MAX
+
+    lay, coords, _refs, _, _geom = scene
+    cache = {}
+    shape = (lay.nz, lay.ny, lay.nx)
+    pair = lay.pairs[0]
+    for drift in range(WEIGHTS_CACHE_MAX * 4):
+        moved = type(coords)(
+            tuple(
+                {
+                    n: (c + np.array([0, 0, drift]) if n == pair.b else c)
+                    for n, c in frame.items()
+                }
+                for frame in coords.by_time
+            )
+        )
+        blend_weights(pair.a, 0, moved, lay.pairs_at(0), shape, cache)
+        assert len(cache) <= WEIGHTS_CACHE_MAX
+
+
+def test_weights_cache_still_hits_on_a_steady_placement(scene):
+    lay, coords, _refs, _, _geom = scene
+    cache = {}
+    shape = (lay.nz, lay.ny, lay.nx)
+    first = blend_weights("tile_a", 0, coords, lay.pairs_at(0), shape, cache)
+    for t in range(lay.nt):
+        assert (
+            blend_weights("tile_a", t, coords, lay.pairs_at(t), shape, cache) is first
+        )
+
+
+def test_compose_returns_the_canvas_dtype(scene):
+    """Held across the next compose, so it must not be float32."""
+    lay, coords, _refs, _, geom = scene
+    img, _boxes, _region = _compose(0, lay, coords, NamedReader(), geom)
+    assert img.dtype == np.dtype(geom.dtype)

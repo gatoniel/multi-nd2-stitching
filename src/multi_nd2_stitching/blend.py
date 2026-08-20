@@ -188,19 +188,33 @@ def _weights_key(name, t, coords, pairs, tile_shape):
     return (tile_shape, tuple(sorted(parts)))
 
 
+WEIGHTS_CACHE_MAX = 24
+
+
 def blend_weights(name, t, coords: Coordinates, pairs, tile_shape, cache=None):
     """Linear ramps across every edge that has a neighbour.
 
     Only the relative shape matters: the caller divides by the accumulated
     weight, so a solo region comes out unchanged whatever its weight was.
 
-    The result depends only on the tile size and the ramp lengths, and the
-    placement is constant for long stretches of time, so an optional cache
-    keyed on those turns this into a lookup. Callers must not mutate it.
+    The result depends only on the tile size and the ramp lengths, so an
+    optional cache keyed on those turns this into a lookup while the placement
+    holds still. Callers must not mutate it.
+
+    The cache is BOUNDED, and that is not optional. A ramp length is the
+    measured separation between two tiles, which drifts by a pixel or two from
+    timepoint to timepoint, so distinct keys accumulate for as long as the run
+    lasts -- at a 724x724 tile each entry is 2 MB, and an unbounded cache grows
+    without limit. When it fills it is dropped whole: consecutive timepoints
+    are what share keys, so recent entries are the only ones worth keeping.
     """
     key = _weights_key(name, t, coords, pairs, tile_shape)
-    if cache is not None and key in cache:
-        return cache[key]
+    if cache is not None:
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        if len(cache) >= WEIGHTS_CACHE_MAX:
+            cache.clear()
 
     here = coords.at(t)
     w = [
@@ -279,6 +293,7 @@ def compose_timepoint(
     geometry: CanvasGeometry,
     region,
     boxes,
+    dtype="uint16",
     buffer=None,
     weights_cache=None,
 ):
@@ -317,7 +332,9 @@ def compose_timepoint(
     # leaves them at zero without needing a mask array.
     np.maximum(counts, 1e-12, out=counts)
     accum /= counts
-    return accum
+    # Convert here rather than per chunk in the writer: the result is held for
+    # the whole of the next timepoint's compose, and uint16 is half of float32.
+    return accum.astype(dtype)
 
 
 def bbox_of(inds) -> list[list[int]] | None:
@@ -440,6 +457,17 @@ def write_with_retry(fn, attempts: int = 4, delay: float = 2.0):
     raise last
 
 
+def peak_rss_mb() -> float:
+    """Peak resident memory of this process, in MB. 0.0 where unavailable."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - Windows
+        return 0.0
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Linux reports KiB, macOS bytes.
+    return round(peak / (2**20 if peak > 2**32 else 2**10), 1)
+
+
 @attrs.define
 class Timings:
     """Where the wall clock went. Read, compose and write have opposite fixes."""
@@ -468,10 +496,11 @@ class Timings:
         else:
             out["other_s"] = round(slack, 1)
         out["total_s"] = round(self.total, 1)
+        out["peak_mb"] = peak_rss_mb()
         return out
 
 
-def _write_region(canvas, t, image, region, boxes, stale, chunk_zyx, dtype, pool):
+def _write_region(canvas, t, image, region, boxes, stale, chunk_zyx, pool):
     """Push one timepoint's chunks. Distinct zarr chunks are independent files,
     so they can go out concurrently -- on a network share the round trips
     dominate and serialising them wastes the link."""
@@ -495,7 +524,7 @@ def _write_region(canvas, t, image, region, boxes, stale, chunk_zyx, dtype, pool
         local = tuple(
             slice(sl[a].start - origin[a], sl[a].stop - origin[a]) for a in range(3)
         )
-        canvas[(t, *sl)] = image[local].astype(dtype)
+        canvas[(t, *sl)] = image[local]
 
     if pool is None or len(slices) < 2:
         for sl in slices:
@@ -528,6 +557,16 @@ def blend(
     fetched while this one composes, and this one is being written while the
     next composes. Serialised, the disk idles through every compose and the CPU
     idles through every write.
+
+    Memory, roughly, at steady state:
+
+        2 x (tiles of one timepoint)     one batch in flight, one being used
+        1 x (region as float32) x 2      accum + counts, while composing
+        2 x (region as canvas dtype)     one written, one just composed
+
+    The region grows with the mosaic, so a run whose object spreads over time
+    uses more memory late than early -- that is the working set, not a leak.
+    It is bounded by the canvas. `pipeline=False` removes roughly half of it.
     """
     import zarr
 
@@ -588,7 +627,6 @@ def blend(
                     boxes,
                     stale,
                     chunk_zyx,
-                    geometry.dtype,
                     write_pool,
                 ),
                 attempts=attempts,
@@ -638,6 +676,7 @@ def blend(
                     geometry,
                     region,
                     boxes,
+                    dtype=geometry.dtype,
                     buffer=buffer,
                     weights_cache=weights_cache,
                 )
