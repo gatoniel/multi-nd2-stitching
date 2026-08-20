@@ -252,7 +252,7 @@ viewer.layers.clear()
 colormaps = ["magenta", "cyan"]
 for name in ("response", "overlap", "nominal", "measured"):
     array = path / f"{name}.zarr"
-    if not array.exists():        # response is absent if --no-response was used
+    if not array.exists():  # response is absent if --no-response was used
         continue
     img = zarr.open(str(array), mode="r")
     if name == "response":
