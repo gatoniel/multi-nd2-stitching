@@ -7,10 +7,10 @@ than raising KeyError or looping forever.
 
 from __future__ import annotations
 
-from collections import deque
-
 import attrs
 import numpy as np
+
+from .placement import DRIFT, ORIGIN, plan_placement
 
 
 class MissingOffsets(Exception):
@@ -84,50 +84,37 @@ def build_coordinates(
     for t in range(t1):
         in_window = t >= t0
         here: dict[str, np.ndarray] = {}
-
-        # --- seeds: anchors carry their own position forward through drift ---
-        for name in layout.anchors_at(t):
-            if t == 0 or name not in frames[t - 1]:
-                if not here:
-                    here[name] = np.zeros(3)  # first anchor defines the origin
+        # The routing comes from placement.plan_placement, so the graph printed
+        # by `stitch graph` is exactly the one walked here.
+        for step in plan_placement(layout, t).steps:
+            if step.kind == ORIGIN:
+                here[step.tile] = np.zeros(3)
                 continue
-            task = time_by.get((name, t))
-            if task is None:
+            if step.kind == DRIFT:
+                task = time_by.get((step.tile, t))
+                if task is None or step.tile not in frames[t - 1]:
+                    continue
+                offset = store.get(task.key)
+                if offset is None:
+                    missing.append(task.describe())  # drift is needed either way
+                    continue
+                here[step.tile] = frames[t - 1][step.tile] + offset.as_array()
+                continue
+
+            # a neighbour edge: the parent must already be placed
+            forward = pair_by.get((step.via, step.tile, step.axis, t))
+            backward = pair_by.get((step.tile, step.via, step.axis, t))
+            task = forward or backward
+            if task is None or step.via not in here:
                 continue
             offset = store.get(task.key)
             if offset is None:
-                missing.append(task.describe())  # drift is needed either way
-                continue
-            here[name] = frames[t - 1][name] + offset.as_array()
-
-        if not here and layout.tiles_at(t):
-            # nothing anchored: fall back to the first alive tile at the origin
-            here[layout.tiles_at(t)[0]] = np.zeros(3)
-
-        # --- flood fill along the neighbour graph ---------------------------
-        pairs = deque(layout.pairs_at(t))
-        stalled = 0
-        while pairs and stalled <= len(pairs):
-            p = pairs.popleft()
-            task = pair_by.get((p.a, p.b, p.axis, t))
-            offset = store.get(task.key) if task is not None else None
-            if offset is None:
-                if task is not None and in_window:
+                if in_window:
                     missing.append(task.describe())
-                stalled += 1
                 continue
             arr = offset.as_array()
-            if p.a in here and p.b not in here:
-                here[p.b] = here[p.a] + arr
-                stalled = 0
-            elif p.b in here and p.a not in here:
-                here[p.a] = here[p.b] - arr
-                stalled = 0
-            elif p.a in here and p.b in here:
-                stalled += 1  # already placed, consistent or not
-            else:
-                pairs.append(p)  # neither end placed yet; try again later
-                stalled += 1
+            here[step.tile] = here[step.via] + (arr if forward else -arr)
+
         frames.append(here)
 
     frames.extend({} for _ in range(layout.nt - len(frames)))

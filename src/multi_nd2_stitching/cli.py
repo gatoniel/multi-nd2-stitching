@@ -112,6 +112,57 @@ def cmd_timeline(args) -> int:
     return 0
 
 
+def cmd_graph(args) -> int:
+    from .placement import placements_for, render
+
+    _ws, _cfg, _meta, layout = _prepare(args, need_metadata=True)
+    t0 = 0 if args.between is None else args.between[0]
+    t1 = layout.nt if args.between is None else args.between[1]
+    if not 0 <= t0 < t1 <= layout.nt:
+        print(f"t={t0}..{t1} is outside the timeline 0..{layout.nt}", file=sys.stderr)
+        return 1
+
+    if args.tile and args.tile not in layout.tiles:
+        print(
+            f"unknown tile '{args.tile}'; known: {', '.join(layout.tiles)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    places = placements_for(layout, t0, t1)
+    ambiguous = [p for p in places if p.ambiguous]
+    stuck = [p for p in places if p.unplaced]
+
+    print(f"tiles      {len(layout.tiles)}   pairs {len(layout.pairs)}")
+    print(f"timepoints {t1 - t0}  (t={t0}..{t1 - 1})")
+    print(
+        f"ambiguous  {len(ambiguous)} timepoint(s)"
+        f"{'' if not ambiguous else f' -- first at t={ambiguous[0].t}'}"
+    )
+    if stuck:
+        print(f"unplaced   {len(stuck)} timepoint(s) with tiles that cannot be placed")
+    print()
+
+    lines = render(places, tile=args.tile)
+    if args.only_ambiguous:
+        keep, block = [], []
+        for line in lines:
+            block.append(line)
+            if line == "":
+                if any("!" in b or "AMBIGUOUS" in b for b in block):
+                    keep.extend(block)
+                block = []
+        lines = keep or ["(no ambiguous timepoints)"]
+
+    text = "\n".join(lines)
+    if args.out:
+        Path(args.out).write_text(text + "\n")
+        print(f"wrote {args.out}")
+    else:
+        print(text)
+    return 1 if (ambiguous and args.strict) else 0
+
+
 def cmd_status(args) -> int:
     ws, cfg, meta, layout = _prepare(args, need_metadata=True)
     plan = _plan_for(args, layout, meta)
@@ -405,7 +456,10 @@ def cmd_inspect(args) -> int:
             nominal = [0, 0, 0]
             nominal[task.axis] = task.shift_px
             delta = [
-                int(a - b) for a, b in zip((offset.dz, offset.dy, offset.dx), nominal)
+                int(a - b)
+                for a, b in zip(
+                    (offset.dz, offset.dy, offset.dx), nominal, strict=False
+                )
             ]
             print(
                 f"{task.a} | {task.b}  axis={task.axis}  "
@@ -557,6 +611,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tl.add_argument("--at", type=int, help="look up one global timepoint")
     tl.set_defaults(func=cmd_timeline)
+
+    g = common(
+        sub.add_parser(
+            "graph", help="how each tile is placed, and whether the route is unique"
+        )
+    )
+    g.add_argument("--between", type=int, nargs=2, metavar=("T0", "T1"))
+    g.add_argument("--tile", help="show only the route that places this tile")
+    g.add_argument(
+        "--only-ambiguous",
+        action="store_true",
+        help="print only the timepoints with a flagged route",
+    )
+    g.add_argument("--out", type=Path, help="write to a file instead of stdout")
+    g.add_argument(
+        "--strict", action="store_true", help="exit non-zero if any route is ambiguous"
+    )
+    g.set_defaults(func=cmd_graph)
 
     s = common(sub.add_parser("status", help="what is done and what is left"))
     s.add_argument("--between", type=int, nargs=2, metavar=("T0", "T1"))

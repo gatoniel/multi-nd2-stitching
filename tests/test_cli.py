@@ -716,3 +716,84 @@ def test_library_and_cli_defaults_agree():
     cli_default = build_parser().parse_args(["status", "x.yaml"]).precision
     lib_default = _inspect.signature(build_plan).parameters["precision"].default
     assert cli_default == lib_default == "float32"
+
+
+# --- graph --------------------------------------------------------------------
+def test_graph_prints_the_routing(project, capsys):
+    assert run("graph", project) == 0
+    out = capsys.readouterr().out
+    assert "ambiguous  0 timepoint(s)" in out
+    assert "[origin]" in out and "[drift from t-1]" in out
+    assert "x→ tile_b" in out or "y→ tile_b" in out
+
+
+def test_graph_collapses_identical_timepoints(project, capsys):
+    run("graph", project)
+    out = capsys.readouterr().out
+    assert "t=1..7" in out, "constant topology should print as one run"
+
+
+def test_graph_tile_mode(project, capsys):
+    assert run("graph", project, "--tile", "tile_b") == 0
+    out = capsys.readouterr().out
+    assert "tile_b" in out
+    assert "└─" not in out
+
+
+def test_graph_unknown_tile(project, capsys):
+    assert run("graph", project, "--tile", "nope") == 1
+    assert "unknown tile" in capsys.readouterr().err
+
+
+def test_graph_between(project, capsys):
+    run("graph", project, "--between", 0, 3)
+    assert "timepoints 3" in capsys.readouterr().out
+
+
+def test_graph_writes_a_file(project, tmp_path, capsys):
+    out = tmp_path / "graph.txt"
+    assert run("graph", project, "--out", out) == 0
+    assert "[origin]" in out.read_text()
+
+
+def test_graph_flags_a_dropped_tile(project, capsys, tmp_path, monkeypatch):
+    import yaml as _y
+
+    cfg = _y.safe_load(project.read_text())
+    cfg["overrides"] = [{"at": 3, "drop": ["tile_b"]}]
+    project.write_text(_y.safe_dump(cfg))
+    run("graph", project)
+    out = capsys.readouterr().out
+    assert "t=3" in out
+
+
+def test_graph_strict_exits_nonzero_on_ambiguity(project, capsys, monkeypatch):
+    """Two anchors on one chain: the placement depends on traversal order."""
+    import yaml as _y
+    from helpers import make_meta
+
+    from multi_nd2_stitching import metadata as _M
+
+    monkeypatch.setattr(
+        _M,
+        "read_metadata",
+        lambda paths: make_meta(n_files=2, nt=4, nz=4, ny=8, nx=8, paths=list(paths)),
+    )
+    cfg = _y.safe_load(project.read_text())
+    cfg["positions"]["tile_b"]["reference_in_files"] = [0, 1]
+    project.write_text(_y.safe_dump(cfg))
+    assert run("graph", project, "--strict") == 1
+    out = capsys.readouterr().out
+    assert "anchors in one component" in out
+
+
+def test_graph_only_ambiguous_filters(project, capsys, monkeypatch):
+    import yaml as _y
+
+    cfg = _y.safe_load(project.read_text())
+    cfg["positions"]["tile_b"]["reference_in_files"] = [0, 1]
+    project.write_text(_y.safe_dump(cfg))
+    run("graph", project, "--only-ambiguous")
+    out = capsys.readouterr().out
+    assert "t=0\n" not in out, "t=0 has a single seed, so it is not ambiguous"
+    assert "anchors in one component" in out

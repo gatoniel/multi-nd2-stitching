@@ -76,3 +76,28 @@ def stub_files(tmp_path, n=2, prefix="f", size=100):
         p.write_bytes(b"x" * (size + i))
         out.append(str(p))
     return out
+
+
+def grid_meta(coords, paths, nt=3, nz=4, ny=8, nx=8, voxel=0.1):
+    """Metadata with explicit stage positions, so grids and rings are possible.
+
+    `coords` maps tile name -> (x_um, y_um). make_meta only lays tiles out in a
+    line, which cannot produce a cycle.
+    """
+    names = tuple(coords)
+    stage = tuple(coords[n] for n in names)
+    return Metadata(
+        tuple(
+            FileMeta(
+                path=paths[i],
+                nt=nt,
+                nz=nz,
+                ny=ny,
+                nx=nx,
+                position_names=names,
+                stage_um=stage,
+                voxel_x_um=voxel,
+            )
+            for i in range(len(paths))
+        )
+    )
