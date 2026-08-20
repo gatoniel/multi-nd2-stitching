@@ -1,95 +1,133 @@
-# multi-nd2-stitching
+# CLAUDE.md
 
-Stitches multi-position, multi-timepoint microscopy time-lapses from Nikon
-`.nd2` files into one mosaic (a `zarr` canvas), for sessions that span
-**several separate .nd2 files** (e.g. the microscope was restarted) and where
-tiles can appear, disappear, or need manual correction partway through.
+Guidance for Claude Code when working in this repository.
 
-Core ideas:
-- **Tiles** (named stage positions) are tracked across files by name/alias,
-  with explicit `start`/`end` file ranges in a YAML config
-  (`StitchingConfig` in `config.py`).
-- **Neighbor pairs** are inferred automatically from stage coordinates (grid
-  spacing ± tolerance), never configured manually.
-- Two kinds of offsets are computed via FFT phase correlation: **pair
-  offsets** (tile-to-tile overlap, per timepoint) and **time offsets** (drift
-  of "anchor" tiles between consecutive timepoints). A flood-fill
-  (`final_coordinates`) turns pairwise offsets into one global coordinate per
-  tile per timepoint.
-- **Overrides** in the YAML let a human drop a bad tile, designate a new
-  anchor, or force realignment at specific timepoints; `validate.py` checks
-  these stay internally consistent and that the anchor graph never
-  disconnects.
+## Commands
 
-## Two generations of code — do not conflate them
+```bash
+uv sync                      # install, including the dev group
+uv run pytest                # 400+ tests, runs in ~10s
+uv run pytest tests/test_blend.py::test_name    # one test
+uv run stitch --help         # the CLI
 
-1. **Legacy** — `stitching.py`'s `PositionAlignment` class. Monolithic (I/O +
-   FFT + blending in one class), and it reads config attributes
-   (`config.names`, `config.start_names`, `config.ignore_timepoints`,
-   `config.start_names_manual`, `config.manual_realignment_time`) that **no
-   longer exist** on the current `StitchingConfig`. It is out of sync with
-   the current config schema and will raise at runtime. No test imports it.
-   Do not "fix" it by changing the new config schema to match it — the
-   schema in `config.py` is the current one; `stitching.py` is the thing
-   that's stale.
-2. **New, layered rewrite** — clean separation, fully tested:
-   - `metadata.py` — reads ND2 headers only (no pixel data), cached by file
-     stamp (path/size/mtime)
-   - `config.py` — YAML → `StitchingConfig` via `attrs`/`cattrs`
-   - `layout.py` — pure function `(config, metadata) -> Layout`: tiles,
-     pairs, aliveness masks, anchors. Nothing here is cached; it's cheap
-     enough to rebuild from scratch every run so the result depends only on
-     the YAML.
-   - `validate.py` — three tiers of checks: config-only → +timeline (needs
-     per-file timepoint counts) → +neighbor graph (needs a built `Layout`).
-     Used by the `stitch-validate` CLI.
-   - `offsets.py` — turns a `Layout` into a `Plan` of content-addressed
-     `TimeTask`/`PairTask` units.
-   - `store.py` — append-only JSONL offset cache: interrupt-safe, resumable,
-     greppable (one JSON record per line, last line wins for a repeated key).
-   - `compute.py` — runs a `Plan` against an `OffsetStore` and a
-     `VolumeReader` protocol; pure correlation functions are array → array.
-   - `cli.py` — currently only wires up `stitch-validate`.
-
-**Gap**: the new pipeline stops at offset computation. There is no rebuilt
-equivalent yet of `stitching.py`'s `blend()` (assembling the final `zarr`
-canvas with weighted blending across overlaps). `stitch-validate` is the only
-CLI entry point that exists today.
-
-## The caching invariant (`offsets.py` / `store.py`)
-
-A task's cache key is a hash of *exactly* the inputs that determine its
-value: the file's (path, size, mtime) stamp, the stage position index, the
-local timepoint, and the crop — **never** a tile's name or its index in a
-sorted list. Renaming a tile or reordering/prepending config entries must not
-invalidate cached FFT results. Preserve this when touching `offsets.py`.
-
-## Dev commands
-
-```
-uv run pytest -q
-uv run stitch-validate <config.yaml> [--deep] [--check-files] [--cache DIR]
+ruff format src/ tests/
+ruff check --fix --unsafe-fixes src/ tests/
 ```
 
-## Testing conventions
+**Run `ruff format` and `ruff check --fix --unsafe-fixes` before running the
+tests and before reporting work as done.** There is no `[tool.ruff]` section in
+`pyproject.toml` — ruff's defaults are the style, deliberately.
 
-- `tests/helpers.py` builds synthetic `Metadata` (`make_meta`) and a
-  `Layout` (`build`) from a plain dict + YAML, so `layout.py`/`validate.py`
-  tests need no real `.nd2` files.
-- `FakeReader` (in `tests/helpers.py`) produces deterministic, known-shift
-  volumes for `compute.py` correlation tests.
-- Note: `tests/conftest.py` also defines its own copy of `FakeReader`, which
-  currently looks unused — a candidate cleanup, not something to silently
-  resolve without checking first.
+There is no way to run the pipeline end to end without ND2 files. Everything
+below the reader is tested against synthetic metadata and fake volumes; see
+`tests/helpers.py`.
 
-## Style already in the repo — keep it consistent
+## What this does
 
-- `attrs` (`@attrs.frozen`, `@attrs.define(kw_only=True)`) over plain classes
-  or `dataclass`.
-- `cattrs` for YAML/JSON (de)serialization, with custom structure hooks
-  (see `config.py`'s handling of `Slices3D`/`Timepoints`).
-- Comments explain *why*, not what — module docstrings state the rationale
-  for a layer's existence (e.g. why `metadata.py` is the only layer that
-  touches `nd2`, why `layout.py` is uncached).
-- No defensive error handling for internal invariants that can't happen;
-  validation lives in `validate.py` at the config/metadata boundary.
+Stitches multi-tile ND2 microscopy timelapses. Several `.nd2` files, each with
+several stage positions (tiles), concatenated onto one global time axis, offsets
+found by FFT phase correlation, blended into a zarr canvas. A single YAML file
+configures a run.
+
+## Architecture
+
+Layers, in dependency order. Each one only knows about the ones above it.
+
+| module | holds | cost | cached? |
+| --- | --- | --- | --- |
+| `config.py` | the YAML, as attrs classes | free | no |
+| `metadata.py` | ND2 header facts | file opens | **yes**, JSON |
+| `layout.py` | tiles, pairs, timeline, masks | microseconds | no |
+| `placement.py` | how each tile gets placed | microseconds | no |
+| `offsets.py` | the work list and its cache keys | free | no |
+| `compute.py` | phase correlation, the runner | hours | — |
+| `reader.py` | ND2 volumes, refcounted caches | I/O | in memory |
+| `store.py` | computed offsets | — | **yes**, JSONL |
+| `coordinates.py` | offsets → absolute positions | free | no |
+| `blend.py` | compositing onto zarr | hours | canvas + log |
+| `validate.py` | three tiers of checks | free–cheap | no |
+| `cli.py` | subcommands | — | — |
+
+The caching rule that everything follows: **cache only what is expensive *and*
+derived from bytes on disk. Recompute everything else.** `Layout` is free, so it
+is rebuilt every run; that is what keeps the result a pure function of the YAML.
+
+## Invariants
+
+Breaking any of these produces silently wrong output rather than an error.
+Treat a change that touches one as needing a test that pins it.
+
+**Cache keys name pixels, not tiles.** A `VolumeRef` is
+`(file_hash, position, local_t, nz)` — never a tile name, never an index into a
+sorted list, never a global timepoint. Renaming a tile or prepending a file must
+leave every cached offset valid. Adding anything to a key invalidates the
+store, so `precision` belongs there (it changes the result) and a comment does
+not.
+
+**Deleting a cache must change nothing but runtime.** True of the metadata
+cache, the offset store, and the blend log. If a code path can behave
+differently because a cache is present, that path is wrong.
+
+**Canvas geometry is fixed when the canvas is created** and stored in
+`<output>.geometry.json`. Never recompute it for an existing canvas: the
+required extent is a min/max over every timepoint, so recomputing can move the
+origin and silently remap everything already written. A corrupt sidecar raises;
+it does not fall back to deriving a new one.
+
+**`placement.py` owns the traversal.** `build_coordinates` walks
+`plan_placement`'s steps, so `stitch graph` shows the placement that actually
+happens. Do not reimplement the flood fill anywhere else.
+
+**Every tile has exactly one placement route.** Two anchors in one connected
+component, or a cycle in the neighbour graph, means the result depends on
+traversal order. Those are flagged, never silently resolved.
+
+**The blend crop must not touch the correlation axis.** `crop_for_alignment`
+owns that axis; cropping it removes the overlap strip the correlation needs.
+See `Crop.free_axis`.
+
+**Per-timepoint blend work is bounded by the bounding box, not the canvas.**
+A whole-canvas `np.divide` costs in proportion to the canvas, which makes
+padding ruinously expensive. Same for zarr writes: they must start on chunk
+boundaries or zarr read-modify-writes every partial chunk.
+
+## Conventions
+
+- attrs classes, `@attrs.frozen` where possible. cattrs for YAML and JSON.
+- Config parsing is structural; **semantic checks live in `validate.py`** and
+  return a *list* of problems rather than raising on the first.
+- Optional config fields need `| None` in the annotation for
+  `default_if_none` converters to run — cattrs structures before the converter
+  sees the value.
+- Narrow exception handlers. `_PARSE_ERRORS` is the tuple for malformed
+  JSON/JSONL. A skipped line warns; it never passes silently.
+- Threads, not processes: scipy.fft and the ND2 reads release the GIL, and the
+  caches hold arrays far too large to pickle.
+- No `__del__`. Resources go through context managers.
+
+## Tests
+
+- `tests/helpers.py` holds pure helpers (`make_meta`, `grid_meta`, `build`,
+  `stub_files`, `FakeReader`) and is imported normally. `tests/conftest.py`
+  holds only real fixtures (`cfg_dict`, `parse`) and is never imported.
+- Config tests parametrize over *every optional field being absent* and over
+  *every optional field being explicitly `null`* — two different code paths,
+  and the second is the common hand-editing accident.
+- Test the module you import from, not the package root.
+- `grid_meta` when a test needs a 2D layout; `make_meta` only makes a line, so
+  it cannot produce a cycle.
+
+## Gotchas
+
+- `end` in a position is an **exclusive file index**, while `start` is a
+  `(file, timepoint)` pair. The asymmetry is a trap.
+- Drift is absolute: placing timepoint `t` needs every drift step from 0.
+  Pair offsets are local to their timepoint.
+- The `nd2` handle is not thread-safe. Never peek into the handle pool
+  (`pool.queue[0]`); check a handle out, or use the reserved index handle.
+- `np.zeros` hands back lazily-zeroed pages, so allocating a fresh buffer per
+  timepoint measures *faster* than reusing one with `[:] = 0`. Do not "optimize"
+  that.
+- Measure before attributing a slowdown. Several plausible causes in this
+  codebase turned out to be noise; the real ones were unaligned zarr writes and
+  whole-canvas passes.
