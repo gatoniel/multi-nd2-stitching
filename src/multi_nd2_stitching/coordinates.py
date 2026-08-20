@@ -44,6 +44,22 @@ class Coordinates:
         t, name = key
         return self.by_time[t][name]
 
+    def restrict(self, keep: dict[int, tuple]) -> Coordinates:
+        """A view holding only `keep[t]` at each timepoint.
+
+        Everything downstream -- extent, canvas geometry, the blend log key --
+        reads the coordinates, so narrowing them here narrows all of it without
+        any of those needing to know why. Positions are untouched, so a
+        restricted canvas stays comparable with a full one.
+        """
+        return Coordinates(
+            by_time=tuple(
+                {n: c for n, c in frame.items() if n in set(keep.get(t, ()))}
+                for t, frame in enumerate(self.by_time)
+            ),
+            window=self.window,
+        )
+
     def extent(
         self, tile_shape, t0: int | None = None, t1: int | None = None
     ) -> np.ndarray:

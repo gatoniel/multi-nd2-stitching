@@ -248,3 +248,95 @@ def test_the_handover_is_a_single_timepoint(scene):
     assert [s.tile for s in plan_placement(lay, 1).seeds] == ["b"]
     assert [s.tile for s in plan_placement(lay, 2).seeds] == ["a"]
     assert plan_placement(lay, 2).by_tile["b"].via == "a"
+
+
+# --- the anchor skeleton ------------------------------------------------------
+def test_a_steady_anchor_needs_only_itself(scene):
+    """The case that makes this worth doing: one anchor throughout."""
+    from multi_nd2_stitching.placement import anchor_skeleton
+
+    lay = chain(scene)
+    keep = anchor_skeleton(lay)
+    assert all(v == ("a",) for t, v in keep.items() if t > 0)
+
+
+def test_the_skeleton_is_smaller_than_the_mosaic(scene):
+    from multi_nd2_stitching.placement import anchor_skeleton
+
+    lay = chain(scene)
+    keep = anchor_skeleton(lay)
+    assert sum(len(v) for v in keep.values()) < sum(
+        len(lay.tiles_at(t)) for t in range(lay.nt)
+    )
+
+
+def test_t0_keeps_the_origin(scene):
+    from multi_nd2_stitching.placement import anchor_skeleton
+
+    assert anchor_skeleton(chain(scene))[0] == ("a",)
+
+
+def test_a_handover_pulls_in_the_chain_between_the_anchors(scene):
+    """b becomes the anchor at t=2, so at t=1 it must already be placed --
+    which drags in everything on its route back to a."""
+    from multi_nd2_stitching.placement import anchor_skeleton
+
+    lay = scene(
+        {
+            "a": {"start": [0, 0], **ANCHOR},
+            "b": {"start": [0, 0]},
+            "c": {"start": [0, 0]},
+        },
+        LINE,
+        overrides=[{"at": 2, "unanchor": ["a"], "anchor": ["c"]}],
+    )
+    keep = anchor_skeleton(lay)
+    assert set(keep[1]) == {"a", "b", "c"}, "c must be placed at t=1 to drift from"
+    # a takes the anchor back at t=3, so it must be placed at t=2 -- and at t=2
+    # a hangs off c, so the whole chain comes along
+    assert set(keep[2]) == {"a", "b", "c"}
+    assert set(keep[3]) == {"a"}, "steady again: only the anchor"
+
+
+def test_the_skeleton_covers_every_anchor(scene):
+    from multi_nd2_stitching.placement import anchor_skeleton
+
+    lay = scene(
+        {
+            "a": {"start": [0, 0], **ANCHOR},
+            "b": {"start": [0, 0]},
+            "c": {"start": [0, 0]},
+        },
+        LINE,
+        overrides=[{"at": 2, "unanchor": ["a"], "anchor": ["c"]}],
+    )
+    keep = anchor_skeleton(lay)
+    for t in range(lay.nt):
+        assert set(lay.anchors_at(t)) <= set(keep[t])
+
+
+def test_the_skeleton_is_a_connected_route(scene):
+    """Every kept tile must be reachable from a seed using only kept tiles."""
+    from multi_nd2_stitching.placement import anchor_skeleton
+
+    lay = scene(
+        {
+            "a": {"start": [0, 0], **ANCHOR},
+            "b": {"start": [0, 0]},
+            "c": {"start": [0, 0]},
+        },
+        LINE,
+        overrides=[{"at": 2, "unanchor": ["a"], "anchor": ["c"]}],
+    )
+    keep = anchor_skeleton(lay)
+    for t, tiles in keep.items():
+        p = plan_placement(lay, t)
+        for name in tiles:
+            assert all(s.tile in tiles for s in p.route_to(name))
+
+
+def test_skeleton_respects_a_window(scene):
+    from multi_nd2_stitching.placement import anchor_skeleton
+
+    lay = chain(scene)
+    assert set(anchor_skeleton(lay, 2, 4)) == {2, 3}

@@ -797,3 +797,60 @@ def test_graph_only_ambiguous_filters(project, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "t=0\n" not in out, "t=0 has a single seed, so it is not ambiguous"
     assert "anchors in one component" in out
+
+
+# --- skeleton blend -----------------------------------------------------------
+def test_skeleton_draws_fewer_tiles(project, capsys):
+    import zarr
+
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    assert run("blend", project, "--skeleton", "--no-progress") == 0
+    out = capsys.readouterr().out
+    assert "skeleton" in out and "tile placements" in out
+    assert zarr.open(str(Workspace.of(project).root / "skeleton.zarr"), mode="r").shape
+
+
+def test_skeleton_uses_its_own_default_path(project, capsys):
+    """A skeleton canvas is small; it must not fix the frame for the full blend."""
+    run("offsets", project, "--no-progress")
+    run("blend", project, "--skeleton", "--no-progress")
+    ws = Workspace.of(project)
+    assert (ws.root / "skeleton.zarr").exists()
+    assert not ws.canvas.exists()
+
+
+def test_skeleton_canvas_is_smaller_than_the_full_one(project, capsys):
+    import json
+
+    run("offsets", project, "--no-progress")
+    run("blend", project, "--skeleton", "--no-progress")
+    run("blend", project, "--no-progress")
+    ws = Workspace.of(project)
+    thin = json.loads((ws.root / "skeleton.zarr.geometry.json").read_text())
+    full = json.loads((ws.root / "canvas.zarr.geometry.json").read_text())
+    assert thin["shape"][3] < full["shape"][3]
+
+
+def test_skeleton_and_full_can_share_an_output_only_via_recreate(project, tmp_path):
+    """Explicit --output lets you collide the two; the frame guard catches it."""
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "shared.zarr"
+    run("blend", project, "--skeleton", "--output", out, "--no-progress")
+    assert run("blend", project, "--output", out, "--no-progress") == 1
+
+
+def test_skeleton_reports_the_reduction(project, capsys):
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    run("blend", project, "--skeleton", "--no-progress")
+    out = capsys.readouterr().out
+    assert "of 16 tile placements" in out, "2 tiles x 8 timepoints"
+    assert "8 of" in out, "one steady anchor means one tile per timepoint"
+
+
+def test_full_blend_is_unaffected(project, capsys):
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    run("blend", project, "--no-progress")
+    assert "skeleton" not in capsys.readouterr().out

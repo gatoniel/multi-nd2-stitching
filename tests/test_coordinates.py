@@ -192,3 +192,38 @@ def test_frames_outside_the_window_stay_empty(setup):
     coords = build_coordinates(lay, plan, store, 0, 3)
     assert len(coords.by_time) == lay.nt
     assert coords.at(lay.nt - 1) == {}
+
+
+# --- restrict -----------------------------------------------------------------
+def test_restrict_keeps_only_the_named_tiles(setup):
+    lay, plan = setup()
+    coords = build_coordinates(lay, plan, fill(plan, OffsetStore()))
+    thin = coords.restrict(dict.fromkeys(range(lay.nt), ("tile_a",)))
+    for t in range(lay.nt):
+        assert set(thin.at(t)) == {"tile_a"}
+
+
+def test_restrict_leaves_positions_untouched(setup):
+    """Narrowing must not move anything -- the frame has to stay comparable."""
+    lay, plan = setup()
+    coords = build_coordinates(lay, plan, fill(plan, OffsetStore()))
+    thin = coords.restrict(dict.fromkeys(range(lay.nt), ("tile_a",)))
+    for t in range(lay.nt):
+        assert np.array_equal(thin[t, "tile_a"], coords[t, "tile_a"])
+
+
+def test_restrict_shrinks_the_extent(setup):
+    lay, plan = setup()
+    coords = build_coordinates(lay, plan, fill(plan, OffsetStore()))
+    thin = coords.restrict(dict.fromkeys(range(lay.nt), ("tile_a",)))
+    tile = (lay.nz, lay.ny, lay.nx)
+    assert (
+        thin.extent(tile)[2, 1] - thin.extent(tile)[2, 0]
+        < coords.extent(tile)[2, 1] - coords.extent(tile)[2, 0]
+    )
+
+
+def test_restrict_preserves_the_window(setup):
+    lay, plan = setup()
+    coords = build_coordinates(lay, plan, fill(plan, OffsetStore()), 0, 2)
+    assert coords.restrict({0: ("tile_a",)}).window == (0, 2)

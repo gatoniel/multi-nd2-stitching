@@ -287,13 +287,21 @@ def cmd_blend(args) -> int:
         resolve_geometry,
     )
     from .coordinates import MissingOffsets, build_coordinates
+    from .placement import anchor_skeleton
     from .reader import Nd2Reader
 
     ws, cfg, meta, layout = _prepare(args, need_metadata=True)
     plan = build_plan(layout, meta, precision=args.precision)
     store = OffsetStore(ws.offsets)
 
-    output = Path(args.output).expanduser() if args.output else ws.canvas
+    if args.output:
+        output = Path(args.output).expanduser()
+    elif args.skeleton:
+        # A skeleton canvas is sized to a handful of tiles. Sharing a default
+        # path with the full blend would fix that small frame permanently.
+        output = ws.root / "skeleton.zarr"
+    else:
+        output = ws.canvas
     tile_shape = (layout.nz, layout.ny, layout.nx)
     t0 = 0 if args.between is None else args.between[0]
     t1 = layout.nt if args.between is None else args.between[1]
@@ -303,6 +311,16 @@ def cmd_blend(args) -> int:
     except MissingOffsets as e:
         print(str(e), file=sys.stderr)
         return 1
+
+    if args.skeleton:
+        keep = anchor_skeleton(layout, t0, t1)
+        full = sum(len(coords.at(t)) for t in range(t0, t1))
+        coords = coords.restrict(keep)
+        thin = sum(len(v) for v in keep.values())
+        print(
+            f"skeleton   {thin} of {full} tile placements "
+            f"({thin / max(full, 1):.0%}) -- only what fixes the anchors"
+        )
 
     if args.recreate and output.exists():
         import shutil
@@ -660,6 +678,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="where to write the canvas; defaults to <workspace>/canvas.zarr. "
         "Point this at local disk if the share is unreliable.",
+    )
+    b.add_argument(
+        "--skeleton",
+        action="store_true",
+        help="draw only the tiles that carry the anchor chain; much faster, and "
+        "enough to see whether the drift is tracking. Writes to "
+        "<workspace>/skeleton.zarr unless --output says otherwise",
     )
     b.add_argument("--between", type=int, nargs=2, metavar=("T0", "T1"))
     b.add_argument("--dtype", default="uint16")

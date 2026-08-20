@@ -262,3 +262,37 @@ def render(placements, tile: str | None = None, indent: str = "  ") -> list[str]
 def placements_for(layout, t0: int = 0, t1: int | None = None):
     t1 = layout.nt if t1 is None else t1
     return [plan_placement(layout, t) for t in range(t0, t1)]
+
+
+def anchor_skeleton(layout, t0: int = 0, t1: int | None = None) -> dict[int, tuple]:
+    """The smallest set of tiles per timepoint that still fixes every anchor.
+
+    An anchor at t needs its own position at t-1 to drift from. If it was also
+    the anchor at t-1 that costs nothing extra, so a long stretch with one
+    steady anchor needs only that one tile drawn per timepoint. A handover is
+    where it grows: the incoming anchor has to be placed at t-1 through the
+    neighbour graph, which pulls in the chain of tiles between the two.
+
+    Returns {t: tiles}. Everything else in the mosaic is decoration as far as
+    the coordinate system is concerned.
+    """
+    t1 = layout.nt if t1 is None else t1
+    places = {t: plan_placement(layout, t) for t in range(t0, t1)}
+    needed: dict[int, set[str]] = {t: set(layout.anchors_at(t)) for t in range(t0, t1)}
+
+    # An anchor at t must already have a position at t-1.
+    for t in range(t0 + 1, t1):
+        for name in layout.anchors_at(t):
+            needed[t - 1].add(name)
+
+    # Placing a tile means placing everything on its route back to a seed.
+    for t in range(t0, t1):
+        closed: set[str] = set()
+        for name in needed[t]:
+            for step in places[t].route_to(name):
+                closed.add(step.tile)
+        if not closed and layout.tiles_at(t):
+            closed = {places[t].seeds[0].tile} if places[t].seeds else set()
+        needed[t] = closed
+
+    return {t: tuple(sorted(v)) for t, v in needed.items()}
