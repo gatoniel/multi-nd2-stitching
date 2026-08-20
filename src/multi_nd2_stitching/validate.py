@@ -20,6 +20,35 @@ class ConfigError(Exception):
         )
 
 
+_FULL_VOLUME = (slice(None), slice(None), slice(None))
+
+
+def _check_realign(cfg: StitchingConfig, p: list[str]) -> None:
+    """A realign step must actually crop differently, or it does nothing.
+
+    `realign` recomputes a drift offset using `realignment_slices` instead of
+    `slices`. The crop is part of the cache key, so if the two crops are equal
+    the recomputed offset has the same key and the same value as the original:
+    the override is silently a no-op, and the run looks like it honoured it.
+    """
+    names = sorted({n for o in cfg.overrides for n in o.realign})
+    if not names:
+        return
+    where = f"realign is used for {names}, but "
+    if cfg.realignment_slices == _FULL_VOLUME:
+        p.append(
+            where + "realignment_slices is not set, so those steps would be "
+            "recomputed over the whole volume. Set realignment_slices to the "
+            "region that should be correlated instead."
+        )
+    elif cfg.realignment_slices == cfg.slices:
+        p.append(
+            where + "realignment_slices is identical to slices, so those steps "
+            "would recompute to exactly the same offsets. Make them differ, or "
+            "drop the realign."
+        )
+
+
 def _check_positions(cfg: StitchingConfig, p: list[str]) -> None:
     n = cfg.n_files
     for name, pos in cfg.positions.items():
@@ -168,6 +197,7 @@ def check(cfg: StitchingConfig, nts=None, check_files: bool = False) -> list[str
     _check_positions(cfg, p)
     _check_coverage(cfg, p)
     _check_overrides(cfg, p)
+    _check_realign(cfg, p)
     if nts is not None:
         _check_timeline(cfg, list(nts), p)
     return p

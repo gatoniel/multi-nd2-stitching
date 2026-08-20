@@ -21,6 +21,7 @@ def test_realistic_config_is_valid(cfg_dict, parse):
         {"at": 143, "reason": "artefact", "drop": ["a1"], "anchor": ["a2"]},
         {"at": [4, 16, 26, 38], "realign": ["a"]},
     ]
+    cfg_dict["realignment_slices"] = {"y": [300, 700], "x": [300, 700]}
     assert check(parse(cfg_dict)) == []
 
 
@@ -179,3 +180,41 @@ def test_a_clean_handover_passes(cfg_dict, parse):
         }
     ]
     assert check(parse(cfg_dict)) == []
+
+
+# --- realign needs a different crop, or it silently does nothing ---------------
+def test_realign_without_realignment_slices_is_refused(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 5, "realign": ["tile_a"]}]
+    problems = check(parse(cfg_dict))
+    assert any("realignment_slices is not set" in p for p in problems), problems
+
+
+def test_realign_with_identical_slices_is_refused(cfg_dict, parse):
+    """Same crop means the same cache key and the same answer: a no-op."""
+    cfg_dict["overrides"] = [{"at": 5, "realign": ["tile_a"]}]
+    cfg_dict["slices"] = {"z": [5, 40]}
+    cfg_dict["realignment_slices"] = {"z": [5, 40]}
+    problems = check(parse(cfg_dict))
+    assert any("identical to slices" in p for p in problems), problems
+
+
+def test_realign_with_a_different_crop_is_fine(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 5, "realign": ["tile_a"]}]
+    cfg_dict["slices"] = {"z": [5, 40]}
+    cfg_dict["realignment_slices"] = {"z": [5, 40], "y": [300, 700]}
+    assert check(parse(cfg_dict)) == []
+
+
+def test_realignment_slices_alone_is_not_required(cfg_dict, parse):
+    """No realign override means the field is simply unused."""
+    cfg_dict["overrides"] = [{"at": 5, "drop": ["tile_b"]}]
+    assert check(parse(cfg_dict)) == []
+
+
+def test_the_message_names_the_tiles(cfg_dict, parse):
+    cfg_dict["overrides"] = [
+        {"at": 5, "realign": ["tile_a"]},
+        {"at": 9, "realign": ["tile_b"]},
+    ]
+    problems = check(parse(cfg_dict))
+    assert any("['tile_a', 'tile_b']" in p for p in problems), problems
