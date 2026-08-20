@@ -166,6 +166,40 @@ class Nd2Reader:
         finally:
             self._release(file_i)
 
+    def read_many(self, refs) -> dict:
+        """Read several volumes with every frame in flight at once.
+
+        Reading tile by tile caps concurrency at `threads` frames no matter how
+        many tiles are wanted, because each read blocks before the next starts.
+        A network mount is happiest with far more requests outstanding than
+        that, so a whole timepoint goes in as one batch.
+        """
+        if self._stack is None:
+            raise RuntimeError("Nd2Reader must be used as a context manager")
+        refs = list(dict.fromkeys(refs))
+        for ref in refs:
+            self._acquire(self._by_key[ref.file])
+        try:
+            arrays = {}
+            futures = {}
+            for ref in refs:
+                file_i = self._by_key[ref.file]
+                start = self._first_frame_index(file_i, ref)
+                arrays[ref] = np.empty(
+                    (ref.nz, self.ny, self.nx), dtype=self._dtype[file_i]
+                )
+                for z in range(ref.nz):
+                    futures[self._executor.submit(self._frame, file_i, start + z)] = (
+                        ref,
+                        z,
+                    )
+            for fut, (ref, z) in futures.items():
+                arrays[ref][z] = fut.result()
+            return arrays
+        finally:
+            for ref in refs:
+                self._release(self._by_key[ref.file])
+
 
 class VolumeCache:
     """Refcounted volume cache in front of any reader.

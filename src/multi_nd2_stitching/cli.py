@@ -283,6 +283,7 @@ def cmd_blend(args) -> int:
         BlendLog,
         CanvasGeometry,
         CanvasMismatch,
+        Timings,
         blend,
         resolve_geometry,
     )
@@ -394,6 +395,7 @@ def cmd_blend(args) -> int:
         except ImportError:
             pass
 
+    timings = Timings()
     with Nd2Reader(
         cfg.files,
         file_keys(meta),
@@ -401,6 +403,7 @@ def cmd_blend(args) -> int:
         ny=layout.ny,
         nx=layout.nx,
         threads=args.read_threads,
+        max_open_files=args.open_files,
     ) as reader:
         try:
             n = blend(
@@ -413,14 +416,19 @@ def cmd_blend(args) -> int:
                 geometry,
                 t0=t0,
                 t1=t1,
+                chunk=tuple(args.chunk),
                 force=args.force,
                 progress=progress,
                 attempts=args.attempts,
+                writers=args.writers,
+                pipeline=not args.no_pipeline,
+                timings=timings,
             )
         except CanvasMismatch as e:
             print(str(e), file=sys.stderr)
             return 1
     print(f"wrote      {n} timepoint(s)")
+    print(f"timings    {timings.as_dict()}")
     return 0
 
 
@@ -726,6 +734,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     b.add_argument("--dry-run", action="store_true")
     b.add_argument("--no-progress", action="store_true")
+    b.add_argument(
+        "--writers", type=int, default=4, help="zarr chunks written concurrently"
+    )
+    b.add_argument(
+        "--chunk",
+        type=int,
+        nargs=4,
+        default=[1, 32, 512, 512],
+        metavar=("T", "Z", "Y", "X"),
+        help="canvas chunk shape; only applied when the canvas is created",
+    )
+    b.add_argument(
+        "--no-pipeline",
+        action="store_true",
+        help="do not overlap read/compose/write (lower memory, slower)",
+    )
     b.set_defaults(func=cmd_blend)
 
     i = common(sub.add_parser("inspect", help="export a neighbour pair for napari"))

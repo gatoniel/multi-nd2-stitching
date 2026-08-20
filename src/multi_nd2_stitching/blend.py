@@ -17,6 +17,8 @@ import hashlib
 import json
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 
 import attrs
@@ -175,70 +177,147 @@ def resolve_geometry(
     return existing, False
 
 
-def blend_weights(name: str, t: int, coords: Coordinates, pairs, tile_shape):
+def _weights_key(name, t, coords, pairs, tile_shape):
+    here = coords.at(t)
+    parts = []
+    for pair in pairs:
+        if name not in (pair.a, pair.b) or pair.a not in here or pair.b not in here:
+            continue
+        length = int((here[pair.b] - here[pair.a])[pair.axis])
+        parts.append((pair.axis, pair.a == name, length))
+    return (tile_shape, tuple(sorted(parts)))
+
+
+def blend_weights(name, t, coords: Coordinates, pairs, tile_shape, cache=None):
     """Linear ramps across every edge that has a neighbour.
 
     Only the relative shape matters: the caller divides by the accumulated
     weight, so a solo region comes out unchanged whatever its weight was.
+
+    The result depends only on the tile size and the ramp lengths, and the
+    placement is constant for long stretches of time, so an optional cache
+    keyed on those turns this into a lookup. Callers must not mutate it.
     """
+    key = _weights_key(name, t, coords, pairs, tile_shape)
+    if cache is not None and key in cache:
+        return cache[key]
+
     here = coords.at(t)
     w = [
         np.ones(tile_shape[1], dtype=np.float32),
         np.ones(tile_shape[2], dtype=np.float32),
     ]
-
-    for p in pairs:
-        if name not in (p.a, p.b) or p.a not in here or p.b not in here:
+    for pair in pairs:
+        if name not in (pair.a, pair.b) or pair.a not in here or pair.b not in here:
             continue
-        length = int((here[p.b] - here[p.a])[p.axis])
-        if not 0 < length < tile_shape[p.axis]:
+        length = int((here[pair.b] - here[pair.a])[pair.axis])
+        if not 0 < length < tile_shape[pair.axis]:
             continue  # degenerate placement; leave this edge flat
         ramp = np.linspace(0.01, 0.99, length, dtype=np.float32)
-        if p.a == name:
-            w[p.axis - 1][-length:] = ramp[::-1]
+        if pair.a == name:
+            w[pair.axis - 1][-length:] = ramp[::-1]
         else:
-            w[p.axis - 1][:length] = ramp
-    return w[0][:, np.newaxis] * w[1][np.newaxis, :]
+            w[pair.axis - 1][:length] = ramp
+    out = w[0][:, np.newaxis] * w[1][np.newaxis, :]
+    if cache is not None:
+        cache[key] = out
+    return out
 
 
-def compose_timepoint(t, layout, coords, reader, geometry: CanvasGeometry, refs):
-    """Blend one timepoint. Returns (image, mask, bbox).
+def tile_boxes(t, layout, coords: Coordinates, geometry: CanvasGeometry) -> dict:
+    """Where each tile lands on the canvas, as (lo, hi) in zyx.
 
-    Every whole-canvas pass is confined to the covered bounding box. The tiles
-    at one timepoint occupy a small part of a padded canvas, and a full-canvas
-    normalise costs in proportion to the canvas rather than to the data: on a
-    generously padded extent that alone was ~20x the useful work.
-
-    The buffers are freshly allocated each call on purpose -- np.zeros hands
-    back lazily-zeroed pages, so the padding we never touch costs nothing.
+    Known before a single voxel is read, which is the point: the covered region
+    never has to be discovered by scanning a mask.
     """
-    out_shape = geometry.spatial
-    accum = np.zeros(out_shape, dtype=np.float32)
-    counts = np.zeros(out_shape, dtype=np.float32)
-    inds = np.zeros(out_shape, dtype=bool)
-    tile_shape = (layout.nz, layout.ny, layout.nx)
-    pairs = layout.pairs_at(t)
-
+    tile_shape = np.array((layout.nz, layout.ny, layout.nx))
+    out = {}
     for name in layout.tiles_at(t):
         if name not in coords.at(t):
             continue
-        frame = reader.read(refs[(t, name)])
-        z0, y0, x0 = geometry.offset_of(coords[t, name])
+        lo = geometry.offset_of(coords[t, name])
+        out[name] = (
+            tuple(int(v) for v in lo),
+            tuple(int(v) for v in lo + tile_shape),
+        )
+    return out
+
+
+def boxes_bbox(boxes) -> list[list[int]] | None:
+    """Union of tile boxes -- the analytic equivalent of bbox_of(inds)."""
+    if not boxes:
+        return None
+    lo = np.array([b[0] for b in boxes.values()])
+    hi = np.array([b[1] for b in boxes.values()])
+    return [[int(lo[:, a].min()), int(hi[:, a].max())] for a in range(3)]
+
+
+def hits_a_box(sl, boxes) -> bool:
+    return any(
+        all(sl[a].start < hi[a] and lo[a] < sl[a].stop for a in range(3))
+        for lo, hi in boxes.values()
+    )
+
+
+def load_timepoint(reader, refs, t, names) -> dict:
+    """Every tile of one timepoint, read as a single batch where possible."""
+    wanted = {name: refs[(t, name)] for name in names if (t, name) in refs}
+    if not wanted:
+        return {}
+    read_many = getattr(reader, "read_many", None)
+    if read_many is None:
+        return {name: reader.read(ref) for name, ref in wanted.items()}
+    arrays = read_many(list(wanted.values()))
+    return {name: arrays[ref] for name, ref in wanted.items()}
+
+
+def compose_timepoint(
+    t,
+    layout,
+    coords: Coordinates,
+    volumes: dict,
+    geometry: CanvasGeometry,
+    region,
+    boxes,
+    buffer=None,
+    weights_cache=None,
+):
+    """Blend one timepoint into a float32 array covering `region`.
+
+    Buffers are sized to the written region, not to the canvas, so padding and
+    empty space cost nothing at all -- not even the page faults that a
+    whole-canvas mask scan used to force.
+    """
+    origin = np.array([r[0] for r in region])
+    shape = tuple(int(r[1] - r[0]) for r in region)
+    accum = np.zeros(shape, dtype=np.float32)
+    counts = np.zeros(shape, dtype=np.float32)
+    tile_shape = (layout.nz, layout.ny, layout.nx)
+    pairs = layout.pairs_at(t)
+    if buffer is None:
+        buffer = np.empty(tile_shape, dtype=np.float32)
+
+    for name, frame in volumes.items():
+        if name not in boxes:
+            continue
+        z0, y0, x0 = np.array(boxes[name][0]) - origin
         sls = (
             slice(z0, z0 + layout.nz),
             slice(y0, y0 + layout.ny),
             slice(x0, x0 + layout.nx),
         )
-        weights = blend_weights(name, t, coords, pairs, tile_shape)
-        accum[sls] += frame * weights
+        weights = blend_weights(name, t, coords, pairs, tile_shape, weights_cache)
+        # into a reused buffer: the product is a full tile of float32, and
+        # allocating one per tile per timepoint is gigabytes of churn.
+        np.multiply(frame, weights, out=buffer)
+        accum[sls] += buffer
         counts[sls] += weights
-        inds[sls] = True
 
-    box = bbox_of(inds)
-    if box is not None:
-        sl = tuple(slice(*b) for b in box)
-        np.divide(accum[sl], counts[sl], out=accum[sl], where=inds[sl])
-    return accum, inds, box
+    # Uncovered voxels have counts == 0 and accum == 0, so clamping the divisor
+    # leaves them at zero without needing a mask array.
+    np.maximum(counts, 1e-12, out=counts)
+    accum /= counts
+    return accum
 
 
 def bbox_of(inds) -> list[list[int]] | None:
@@ -361,6 +440,70 @@ def write_with_retry(fn, attempts: int = 4, delay: float = 2.0):
     raise last
 
 
+@attrs.define
+class Timings:
+    """Where the wall clock went. Read, compose and write have opposite fixes."""
+
+    read: float = 0.0
+    compose: float = 0.0
+    write: float = 0.0
+    total: float = 0.0
+
+    def as_dict(self) -> dict:
+        """Phase times plus the wall clock.
+
+        When pipelining, the phases run concurrently, so they sum to more than
+        the total; the excess is reported as `overlap_s` and is exactly what the
+        pipeline saved. `other_s` appears instead when the phases sum to less
+        than the wall clock -- that is time going somewhere none of them cover.
+        """
+        slack = self.total - self.read - self.compose - self.write
+        out = {
+            "read_s": round(self.read, 1),
+            "compose_s": round(self.compose, 1),
+            "write_s": round(self.write, 1),
+        }
+        if slack < 0:
+            out["overlap_s"] = round(-slack, 1)
+        else:
+            out["other_s"] = round(slack, 1)
+        out["total_s"] = round(self.total, 1)
+        return out
+
+
+def _write_region(canvas, t, image, region, boxes, stale, chunk_zyx, dtype, pool):
+    """Push one timepoint's chunks. Distinct zarr chunks are independent files,
+    so they can go out concurrently -- on a network share the round trips
+    dominate and serialising them wastes the link."""
+    origin = np.array([r[0] for r in region])
+    (z0, z1), (y0, y1), (x0, x1) = region
+    slices = []
+    for z in range(z0, z1, chunk_zyx[0]):
+        for y in range(y0, y1, chunk_zyx[1]):
+            for x in range(x0, x1, chunk_zyx[2]):
+                sl = (
+                    slice(z, min(z + chunk_zyx[0], z1)),
+                    slice(y, min(y + chunk_zyx[1], y1)),
+                    slice(x, min(x + chunk_zyx[2], x1)),
+                )
+                # Skip chunks no tile touches, unless a previous pass wrote
+                # there and they now need clearing.
+                if hits_a_box(sl, boxes) or overlaps(sl, stale):
+                    slices.append(sl)
+
+    def put_one(sl):
+        local = tuple(
+            slice(sl[a].start - origin[a], sl[a].stop - origin[a]) for a in range(3)
+        )
+        canvas[(t, *sl)] = image[local].astype(dtype)
+
+    if pool is None or len(slices) < 2:
+        for sl in slices:
+            put_one(sl)
+    else:
+        list(pool.map(put_one, slices))
+
+
 def blend(
     layout,
     coords: Coordinates,
@@ -375,8 +518,17 @@ def blend(
     force: bool = False,
     progress=None,
     attempts: int = 4,
+    writers: int = 4,
+    pipeline: bool = True,
+    timings: Timings | None = None,
 ) -> int:
-    """Write timepoints [t0, t1) into an existing geometry. Returns how many."""
+    """Write timepoints [t0, t1) into an existing geometry. Returns how many.
+
+    Read, compose and write are pipelined: the next timepoint's tiles are being
+    fetched while this one composes, and this one is being written while the
+    next composes. Serialised, the disk idles through every compose and the CPU
+    idles through every write.
+    """
     import zarr
 
     t1 = layout.nt if t1 is None else t1
@@ -395,38 +547,117 @@ def blend(
         for t in range(t0, t1)
         if force or not log.is_done(t, log.key(t, coords, geometry))
     ]
+    if not todo:
+        return 0
     it = progress(todo) if progress is not None else todo
 
     spatial = geometry.spatial
     chunk_zyx = chunk[1:]
-    written = 0
-    for t in it:
-        image, inds, new_bbox = compose_timepoint(
-            t, layout, coords, reader, geometry, refs
-        )
-        # Rewriting: also cover whatever the previous pass wrote, so stale pixels
-        # outside the new footprint are erased rather than left behind.
+    tile_shape = (layout.nz, layout.ny, layout.nx)
+    buffer = np.empty(tile_shape, dtype=np.float32)
+    weights_cache: dict = {}
+    timings = Timings() if timings is None else timings
+    started = time.perf_counter()
+
+    plans = {}
+    for t in todo:
+        boxes = tile_boxes(t, layout, coords, geometry)
         stale = log.bbox(t) if log.written(t) else None
-        region = snap_to_chunks(union_bbox(new_bbox, stale), chunk_zyx, spatial)
+        region = snap_to_chunks(
+            union_bbox(boxes_bbox(boxes), stale), chunk_zyx, spatial
+        )
+        plans[t] = (boxes, stale, region)
 
-        def put(t=t, image=image, inds=inds, region=region, stale=stale):
+    def load(t):
+        clock = time.perf_counter()
+        boxes = plans[t][0]
+        out = load_timepoint(reader, refs, t, list(boxes))
+        timings.read += time.perf_counter() - clock
+        return out
+
+    def store(t, image):
+        clock = time.perf_counter()
+        boxes, stale, region = plans[t]
+        if region is not None:
+            write_with_retry(
+                lambda: _write_region(
+                    canvas,
+                    t,
+                    image,
+                    region,
+                    boxes,
+                    stale,
+                    chunk_zyx,
+                    geometry.dtype,
+                    write_pool,
+                ),
+                attempts=attempts,
+            )
+        log.mark(t, log.key(t, coords, geometry), boxes_bbox(boxes))
+        timings.write += time.perf_counter() - clock
+
+    written = 0
+    stack = ExitStack()
+    with stack:
+        # Three separate pools on purpose. `store` runs on store_pool and then
+        # fans its chunks out over write_pool; sharing one pool would have a
+        # task waiting on tasks queued behind itself.
+        write_pool = (
+            stack.enter_context(ThreadPoolExecutor(max_workers=writers))
+            if writers > 1
+            else None
+        )
+        loader = (
+            stack.enter_context(ThreadPoolExecutor(max_workers=1)) if pipeline else None
+        )
+        store_pool = (
+            stack.enter_context(ThreadPoolExecutor(max_workers=1)) if pipeline else None
+        )
+
+        ahead = loader.submit(load, todo[0]) if loader else None
+        pending = None
+
+        # `it` is iterated lazily so a tqdm bar advances as work completes
+        for i, t in enumerate(it):
+            volumes = ahead.result() if ahead is not None else load(t)
+            if loader is not None and i + 1 < len(todo):
+                ahead = loader.submit(load, todo[i + 1])
+            elif loader is not None:
+                ahead = None
+
+            clock = time.perf_counter()
+            boxes, _, region = plans[t]
             if region is None:
-                return
-            (z0, z1), (y0, y1), (x0, x1) = region
-            for z in range(z0, z1, chunk_zyx[0]):
-                for y in range(y0, y1, chunk_zyx[1]):
-                    for x in range(x0, x1, chunk_zyx[2]):
-                        sl = (
-                            slice(z, min(z + chunk_zyx[0], z1)),
-                            slice(y, min(y + chunk_zyx[1], y1)),
-                            slice(x, min(x + chunk_zyx[2], x1)),
-                        )
-                        # Skip chunks with nothing in them, unless the previous
-                        # pass wrote there and they now need clearing.
-                        if inds[sl].any() or overlaps(sl, stale):
-                            canvas[(t, *sl)] = image[sl].astype(geometry.dtype)
+                image = None
+            else:
+                image = compose_timepoint(
+                    t,
+                    layout,
+                    coords,
+                    volumes,
+                    geometry,
+                    region,
+                    boxes,
+                    buffer=buffer,
+                    weights_cache=weights_cache,
+                )
+            del volumes
+            timings.compose += time.perf_counter() - clock
 
-        write_with_retry(put, attempts=attempts)
-        log.mark(t, log.key(t, coords, geometry), new_bbox)
-        written += 1
+            if pending is not None:
+                pending.result()
+            if image is None:
+                store(t, None)
+                pending = None
+            elif store_pool is not None:
+                pending = store_pool.submit(store, t, image)
+            else:
+                store(t, image)
+                pending = None
+            written += 1
+
+        if pending is not None:
+            pending.result()
+
+    timings.total = time.perf_counter() - started
     return written

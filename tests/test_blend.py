@@ -11,8 +11,13 @@ from multi_nd2_stitching.blend import (
     bbox_of,
     blend,
     blend_weights,
+    boxes_bbox,
     compose_timepoint,
+    hits_a_box,
+    load_timepoint,
     resolve_geometry,
+    snap_to_chunks,
+    tile_boxes,
     union_bbox,
     write_with_retry,
 )
@@ -95,27 +100,67 @@ def test_degenerate_placement_leaves_weights_flat(scene):
 
 
 # --- composing ----------------------------------------------------------------
+def _compose(t, lay, coords, reader, geom, chunk=(1, 1, 1)):
+    """Drive the new compose the way blend() does."""
+    boxes = tile_boxes(t, lay, coords, geom)
+    region = snap_to_chunks(boxes_bbox(boxes), chunk, geom.spatial)
+    if region is None:
+        return None, boxes, None
+    volumes = load_timepoint(reader, {(t, n): n for n in boxes}, t, list(boxes))
+    image = compose_timepoint(t, lay, coords, volumes, geom, region, boxes)
+    return image, boxes, region
+
+
+class NamedReader(FlatReader):
+    """load_timepoint passes tile names as refs here, so map on the name."""
+
+    def read(self, ref):
+        self.reads += 1
+        return np.full(self.shape, self.value_by_name[ref], dtype=np.float32)
+
+    def __init__(self, value_by_name=None, shape=(2, 8, 8)):
+        super().__init__(shape=shape)
+        self.value_by_name = value_by_name or {"tile_a": 100.0, "tile_b": 200.0}
+
+
 def test_solo_region_keeps_its_value(scene):
     """Normalisation means a pixel covered by one tile is unchanged."""
-    lay, coords, refs, _, geom = scene
-    img, _inds, _ = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
-    # tile_b (position 1, value 200) sits at x=-5, so it owns the left edge
+    lay, coords, _refs, _, geom = scene
+    img, _boxes, _region = _compose(0, lay, coords, NamedReader(), geom)
+    # tile_b (200) sits at x=-5, so it owns the left edge
     assert img[0, 0, 0] == pytest.approx(200.0)
     assert img[0, 0, -1] == pytest.approx(100.0)
 
 
 def test_overlap_lies_between_the_two_values(scene):
-    lay, coords, refs, _, geom = scene
-    img, _, _ = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
+    lay, coords, _refs, _, geom = scene
+    img, _, _ = _compose(0, lay, coords, NamedReader(), geom)
     overlap = img[0, 0, 5:8]  # world x 0..2, covered by both tiles
     assert np.all(overlap >= 100.0) and np.all(overlap <= 200.0)
     assert not np.all(overlap == overlap[0]), "the overlap should be a gradient"
 
 
-def test_mask_marks_only_covered_pixels(scene):
-    lay, coords, refs, _, geom = scene
-    _, inds, _ = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
-    assert inds.all(), "two tiles 5px apart should tile the whole canvas"
+def test_boxes_cover_the_whole_canvas_here(scene):
+    lay, coords, _refs, _, geom = scene
+    _, boxes, _ = _compose(0, lay, coords, NamedReader(), geom)
+    assert boxes_bbox(boxes) == [[0, lay.nz], [0, lay.ny], [0, lay.nx + 5]]
+
+
+def test_uncovered_voxels_stay_zero(scene):
+    """No mask array any more -- the divisor is clamped instead."""
+    lay, coords, _refs, _, _geom = scene
+    wide = CanvasGeometry(
+        origin=(0, 0, -5), shape=(lay.nt, lay.nz, lay.ny, 40), dtype="uint16"
+    )
+    only_a = type(coords)(tuple({"tile_a": np.zeros(3)} for _ in coords.by_time))
+    # a chunk grid coarser than the tile, so the region extends past it
+    img, _boxes, region = _compose(
+        0, lay, only_a, NamedReader(), wide, chunk=(2, 8, 32)
+    )
+    assert region[2] == [0, 32], "region snapped out beyond the tile"
+    assert img[0, 0, 0] == 0.0, "before the tile: never covered, stays zero"
+    assert img[0, 0, -1] == 0.0, "past the tile: same"
+    assert img[0, 0, 6] == pytest.approx(100.0), "inside the tile"
 
 
 # --- the resume log -----------------------------------------------------------
@@ -485,36 +530,48 @@ def test_empty_chunks_are_skipped(scene, monkeypatch):
 
 
 # --- cost is proportional to the data, not the canvas -------------------------
-def test_normalisation_is_confined_to_the_bounding_box(scene, monkeypatch):
+def test_buffers_are_sized_to_the_region_not_the_canvas(scene):
     """A padded canvas must not make the per-timepoint work bigger."""
-    lay, coords, refs, _, _geom = scene
+    lay, coords, _refs, _, _geom = scene
     wide = CanvasGeometry(
         origin=(0, 0, -5), shape=(lay.nt, lay.nz, lay.ny, 400), dtype="uint16"
     )
-    sizes = []
-    real = np.divide
-
-    def spy(a, b, **kw):
-        sizes.append(a.size)
-        return real(a, b, **kw)
-
-    monkeypatch.setattr(np, "divide", spy)
-    compose_timepoint(0, lay, coords, FlatReader(), wide, refs)
-    assert sizes
-    assert max(sizes) < lay.nz * lay.ny * 400, "divided over the whole canvas"
+    img, _, region = _compose(0, lay, coords, NamedReader(), wide)
+    assert img.size < lay.nz * lay.ny * 400, "allocated the whole canvas"
+    assert img.shape == tuple(int(r[1] - r[0]) for r in region)
 
 
-def test_compose_returns_the_bounding_box(scene):
-    lay, coords, refs, _, geom = scene
-    _, inds, box = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
-    assert box == bbox_of(inds)
+def test_the_box_is_computed_without_touching_pixels(scene):
+    """tile_boxes is analytic; nothing is read to find the covered region."""
+    lay, coords, _refs, _, geom = scene
+    reader = NamedReader()
+    boxes = tile_boxes(0, lay, coords, geom)
+    assert reader.reads == 0
+    assert set(boxes) == set(lay.tiles_at(0))
 
 
 def test_an_empty_timepoint_has_no_box(scene):
-    lay, coords, refs, _, geom = scene
+    lay, coords, _refs, _, geom = scene
     empty = type(coords)(tuple({} for _ in coords.by_time))
-    _, inds, box = compose_timepoint(0, lay, empty, FlatReader(), geom, refs)
-    assert box is None and not inds.any()
+    assert tile_boxes(0, lay, empty, geom) == {}
+    assert boxes_bbox({}) is None
+
+
+def test_hits_a_box(scene):
+    boxes = {"a": ((0, 0, 0), (2, 4, 4))}
+    assert hits_a_box((slice(0, 1), slice(0, 2), slice(0, 2)), boxes)
+    assert not hits_a_box((slice(0, 1), slice(8, 9), slice(0, 2)), boxes)
+    assert not hits_a_box((slice(0, 1), slice(0, 2), slice(0, 2)), {})
+
+
+def test_weights_cache_returns_the_same_array(scene):
+    lay, coords, _, _, _geom = scene
+    cache = {}
+    shape = (lay.nz, lay.ny, lay.nx)
+    a = blend_weights("tile_a", 0, coords, lay.pairs_at(0), shape, cache)
+    b = blend_weights("tile_a", 1, coords, lay.pairs_at(1), shape, cache)
+    assert a is b, "same placement, same weights -- should be a lookup"
+    assert len(cache) == 1
 
 
 # --- padding ------------------------------------------------------------------
@@ -633,3 +690,87 @@ def test_a_clean_blend_log_warns_about_nothing(tmp_path, recwarn):
     BlendLog(p).mark(0, "abc", None)
     BlendLog(p)
     assert not [w for w in recwarn if issubclass(w.category, RuntimeWarning)]
+
+
+# --- pipelining ---------------------------------------------------------------
+def test_pipelined_and_serial_agree(scene, tmp_path):
+    """Overlapping the phases must not change a single voxel."""
+    lay, coords, refs, _, geom = scene
+    a, b = tmp_path / "a.zarr", tmp_path / "b.zarr"
+    blend(lay, coords, FlatReader(), refs, a, BlendLog(None), geom, pipeline=False)
+    blend(lay, coords, FlatReader(), refs, b, BlendLog(None), geom, pipeline=True)
+    assert np.array_equal(
+        zarr.open(str(a), mode="r")[:], zarr.open(str(b), mode="r")[:]
+    )
+
+
+@pytest.mark.parametrize("writers", [1, 2, 8])
+def test_parallel_writers_agree(scene, tmp_path, writers):
+    lay, coords, refs, _, geom = scene
+    ref = tmp_path / "ref.zarr"
+    out = tmp_path / f"w{writers}.zarr"
+    blend(lay, coords, FlatReader(), refs, ref, BlendLog(None), geom, writers=1)
+    blend(lay, coords, FlatReader(), refs, out, BlendLog(None), geom, writers=writers)
+    assert np.array_equal(
+        zarr.open(str(ref), mode="r")[:], zarr.open(str(out), mode="r")[:]
+    )
+
+
+def test_timings_are_recorded(scene, tmp_path):
+    from multi_nd2_stitching.blend import Timings
+
+    lay, coords, refs, _, geom = scene
+    timings = Timings()
+    blend(
+        lay,
+        coords,
+        FlatReader(),
+        refs,
+        tmp_path / "c.zarr",
+        BlendLog(None),
+        geom,
+        timings=timings,
+    )
+    d = timings.as_dict()
+    assert d["total_s"] >= 0.0
+    assert {"read_s", "compose_s", "write_s", "total_s"} <= set(d)
+    # exactly one of the two slack keys, never both
+    assert ("overlap_s" in d) != ("other_s" in d)
+
+
+def test_every_timepoint_is_marked_even_when_pipelined(scene, tmp_path):
+    lay, coords, refs, _, geom = scene
+    logpath = tmp_path / "c.blended"
+    blend(
+        lay,
+        coords,
+        FlatReader(),
+        refs,
+        tmp_path / "c.zarr",
+        BlendLog(logpath),
+        geom,
+        pipeline=True,
+    )
+    reloaded = BlendLog(logpath)
+    for t in range(lay.nt):
+        assert reloaded.is_done(t, reloaded.key(t, coords, geom))
+
+
+def test_a_write_failure_still_propagates_when_pipelined(scene, tmp_path):
+    lay, coords, refs, _, geom = scene
+
+    class Boom(FlatReader):
+        def read(self, ref):
+            raise OSError("mount died")
+
+    with pytest.raises(OSError, match="mount died"):
+        blend(
+            lay,
+            coords,
+            Boom(),
+            refs,
+            tmp_path / "c.zarr",
+            BlendLog(None),
+            geom,
+            pipeline=True,
+        )
