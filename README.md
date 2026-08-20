@@ -17,7 +17,7 @@ the config, and only the affected offsets recompute.
 ## Install
 
 ```bash
-git clone <this repo>
+git clone https://github.com/gatoniel/multi-nd2-stitching.git
 cd multi-nd2-stitching
 uv sync
 ```
