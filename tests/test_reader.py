@@ -2,7 +2,7 @@ from collections import Counter
 
 import numpy as np
 import pytest
-from helpers import FakeReader, build, make_meta
+from helpers import FakeReader, build, make_meta, stub_files
 
 from multi_nd2_stitching.compute import Spectra, run_plan
 from multi_nd2_stitching.offsets import VolumeRef, build_plan
@@ -93,9 +93,7 @@ def test_max_bytes_never_stalls_progress():
 # --- integration with a real plan ---------------------------------------------
 @pytest.fixture
 def real_plan(cfg_dict, tmp_path):
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     cfg_dict["shift_px"] = 3  # tiny, to match the 8x8 fake volumes
     meta = make_meta(n_files=2, nt=5, paths=files)

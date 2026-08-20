@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from multi_nd2_stitching.offsets import Crop, TimeTask, VolumeRef
 from multi_nd2_stitching.store import Offset, OffsetStore
 
@@ -50,7 +52,8 @@ def test_torn_final_line_is_skipped_not_fatal(tmp_path):
     s.put(task(1), Offset(2, 2, 2))
     with p.open("a") as f:
         f.write('{"key": "abc", "off')
-    reopened = OffsetStore(p)
+    with pytest.warns(RuntimeWarning, match="skipped 1 unreadable line"):
+        reopened = OffsetStore(p)
     assert len(reopened) == 2
     assert reopened.skipped == 1
 

@@ -96,7 +96,7 @@ class TimeTask:
     src: VolumeRef
     dst: VolumeRef
     crop: Crop
-    precision: str = "float64"
+    precision: str = "float32"
     realign: bool = False
 
     kind = "time"
@@ -130,7 +130,7 @@ class PairTask:
     dst: VolumeRef
     crop: Crop
     shift_px: int
-    precision: str = "float64"
+    precision: str = "float32"
 
     kind = "pair"
 
@@ -187,7 +187,7 @@ class Plan:
             )
         )
 
-    def spectrum_uses(self):
+    def spectrum_uses(self, tasks=None):
         """How many times each rfftn result is needed.
 
         Time tasks are where this pays: an anchor's spectrum at t is the `dst`
@@ -196,21 +196,25 @@ class Plan:
         because a tile is parent to one neighbour and child to another --
         different strips, different transforms. The counter sorts that out
         without anyone having to special-case it.
+
+        Pass `tasks` when only part of the plan will run -- counting the whole
+        plan overstates the remaining uses of every spectrum, so nothing ever
+        reaches zero and the cache never releases anything.
         """
         from collections import Counter
 
         c = Counter()
-        for task in self.tasks:
+        for task in self.tasks if tasks is None else tasks:
             for ref in task.spectrum_refs():
                 c[ref] += 1
         return c
 
-    def volume_uses(self):
+    def volume_uses(self, tasks=None):
         """How many times each volume is needed. Drives the reader's eviction."""
         from collections import Counter
 
         c = Counter()
-        for task in self.tasks:
+        for task in self.tasks if tasks is None else tasks:
             c[task.src] += 1
             c[task.dst] += 1
         return c
@@ -238,7 +242,7 @@ def file_keys(meta: Metadata) -> tuple[str, ...]:
     return tuple(_digest(attrs.asdict(FileStamp.of(f.path))) for f in meta.files)
 
 
-def build_plan(layout: Layout, meta: Metadata, precision: str = "float64") -> Plan:
+def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Plan:
     """Enumerate every offset the config implies. Pure; touches no pixel data."""
     cfg = layout.config
     fkeys = file_keys(meta)

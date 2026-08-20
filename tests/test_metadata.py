@@ -88,7 +88,8 @@ def test_different_file_list_invalidates(files, fake_nd2, cache_file):
 def test_corrupt_cache_is_ignored_not_fatal(files, fake_nd2, cache_file):
     cache_file.parent.mkdir(parents=True)
     cache_file.write_text("{ not json")
-    meta = M.load_metadata(files, cache=cache_file)
+    with pytest.warns(RuntimeWarning, match="unreadable metadata cache"):
+        meta = M.load_metadata(files, cache=cache_file)
     assert len(meta) == 2
     assert len(fake_nd2) == 1
 
@@ -100,7 +101,8 @@ def test_cache_written_by_an_older_schema_is_ignored(files, fake_nd2, cache_file
     for f in blob["metadata"]["files"]:
         del f["voxel_x_um"]
     cache_file.write_text(json.dumps(blob))
-    M.load_metadata(files, cache=cache_file)
+    with pytest.warns(RuntimeWarning, match="unreadable metadata cache"):
+        M.load_metadata(files, cache=cache_file)
     assert len(fake_nd2) == 2
 
 

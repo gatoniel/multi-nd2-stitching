@@ -2,7 +2,7 @@ import attrs
 import numpy as np
 import pytest
 import zarr
-from helpers import build, make_meta
+from helpers import build, make_meta, stub_files
 
 from multi_nd2_stitching.blend import (
     BlendLog,
@@ -37,9 +37,7 @@ class FlatReader:
 @pytest.fixture
 def scene(cfg_dict, tmp_path):
     """Two 8x8 tiles overlapping by 3 px in x, offsets already in the store."""
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     cfg_dict["shift_px"] = 3
     meta = make_meta(n_files=2, nt=2, nz=2, ny=8, nx=8, paths=files)
@@ -100,7 +98,7 @@ def test_degenerate_placement_leaves_weights_flat(scene):
 def test_solo_region_keeps_its_value(scene):
     """Normalisation means a pixel covered by one tile is unchanged."""
     lay, coords, refs, _, geom = scene
-    img, _inds = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
+    img, _inds, _ = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
     # tile_b (position 1, value 200) sits at x=-5, so it owns the left edge
     assert img[0, 0, 0] == pytest.approx(200.0)
     assert img[0, 0, -1] == pytest.approx(100.0)
@@ -108,7 +106,7 @@ def test_solo_region_keeps_its_value(scene):
 
 def test_overlap_lies_between_the_two_values(scene):
     lay, coords, refs, _, geom = scene
-    img, _ = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
+    img, _, _ = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
     overlap = img[0, 0, 5:8]  # world x 0..2, covered by both tiles
     assert np.all(overlap >= 100.0) and np.all(overlap <= 200.0)
     assert not np.all(overlap == overlap[0]), "the overlap should be a gradient"
@@ -116,7 +114,7 @@ def test_overlap_lies_between_the_two_values(scene):
 
 def test_mask_marks_only_covered_pixels(scene):
     lay, coords, refs, _, geom = scene
-    _, inds = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
+    _, inds, _ = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
     assert inds.all(), "two tiles 5px apart should tile the whole canvas"
 
 
@@ -390,3 +388,248 @@ def test_rewrite_erases_the_old_footprint(scene):
     arr = zarr.open(str(out), mode="r")
     assert arr[0, 0, 0, 20] == 100  # new home
     assert arr[0, 0, 0, 5] == 0, "the old footprint must have been cleared"
+
+
+# --- write layout -------------------------------------------------------------
+def test_snap_to_chunks_grows_to_boundaries():
+    from multi_nd2_stitching.blend import snap_to_chunks
+
+    assert snap_to_chunks(
+        [[5, 40], [7, 600], [13, 20]], (32, 512, 512), (64, 1024, 1024)
+    ) == [[0, 64], [0, 1024], [0, 512]]
+
+
+def test_snap_to_chunks_clips_to_the_canvas():
+    from multi_nd2_stitching.blend import snap_to_chunks
+
+    assert snap_to_chunks(
+        [[0, 50], [0, 10], [0, 10]], (32, 512, 512), (50, 10, 10)
+    ) == [
+        [0, 50],
+        [0, 10],
+        [0, 10],
+    ]
+
+
+def test_snap_to_chunks_passes_none_through():
+    from multi_nd2_stitching.blend import snap_to_chunks
+
+    assert snap_to_chunks(None, (32, 512, 512), (64, 64, 64)) is None
+
+
+def test_overlaps():
+    from multi_nd2_stitching.blend import overlaps
+
+    sl = (slice(0, 10), slice(0, 10), slice(0, 10))
+    assert overlaps(sl, [[5, 8], [5, 8], [5, 8]])
+    assert not overlaps(sl, [[20, 30], [0, 5], [0, 5]])
+    assert not overlaps(sl, None)
+
+
+def test_every_write_starts_on_a_chunk_boundary(scene, monkeypatch):
+    """Unaligned writes force zarr into read-modify-write on partial chunks."""
+    lay, coords, refs, tmp_path, geom = scene
+    out = tmp_path / "canvas.zarr"
+    chunk = (1, 2, 4, 4)
+    starts = []
+    import zarr
+
+    real = zarr.open
+
+    class Spy:
+        def __init__(self, inner):
+            self._inner = inner
+            self.shape = inner.shape
+
+        def __setitem__(self, key, value):
+            starts.append(tuple(s.start for s in key[1:]))
+            self._inner[key] = value
+
+    monkeypatch.setattr(zarr, "open", lambda *a, **k: Spy(real(*a, **k)))
+    blend(lay, coords, FlatReader(), refs, out, BlendLog(None), geom, chunk=chunk)
+    assert starts
+    for z, y, x in starts:
+        assert (z % chunk[1], y % chunk[2], x % chunk[3]) == (0, 0, 0), (z, y, x)
+
+
+def test_empty_chunks_are_skipped(scene, monkeypatch):
+    lay, coords, refs, tmp_path, _ = scene
+    out = tmp_path / "canvas.zarr"
+    # a canvas far wider than the tiles, so most chunks are empty
+    wide = CanvasGeometry(
+        origin=(0, 0, -5), shape=(lay.nt, lay.nz, lay.ny, 64), dtype="uint16"
+    )
+    only_a = type(coords)(tuple({"tile_a": np.zeros(3)} for _ in coords.by_time))
+    writes = []
+    import zarr
+
+    real = zarr.open
+
+    class Spy:
+        def __init__(self, inner):
+            self._inner = inner
+            self.shape = inner.shape
+
+        def __setitem__(self, key, value):
+            writes.append(key)
+            self._inner[key] = value
+
+    monkeypatch.setattr(zarr, "open", lambda *a, **k: Spy(real(*a, **k)))
+    blend(
+        lay, only_a, FlatReader(), refs, out, BlendLog(None), wide, chunk=(1, 2, 4, 4)
+    )
+    per_t = len(writes) / lay.nt
+    assert per_t < (2 * 2 * 16), (
+        f"wrote {per_t} chunks/timepoint on a mostly empty canvas"
+    )
+
+
+# --- cost is proportional to the data, not the canvas -------------------------
+def test_normalisation_is_confined_to_the_bounding_box(scene, monkeypatch):
+    """A padded canvas must not make the per-timepoint work bigger."""
+    lay, coords, refs, _, _geom = scene
+    wide = CanvasGeometry(
+        origin=(0, 0, -5), shape=(lay.nt, lay.nz, lay.ny, 400), dtype="uint16"
+    )
+    sizes = []
+    real = np.divide
+
+    def spy(a, b, **kw):
+        sizes.append(a.size)
+        return real(a, b, **kw)
+
+    monkeypatch.setattr(np, "divide", spy)
+    compose_timepoint(0, lay, coords, FlatReader(), wide, refs)
+    assert sizes
+    assert max(sizes) < lay.nz * lay.ny * 400, "divided over the whole canvas"
+
+
+def test_compose_returns_the_bounding_box(scene):
+    lay, coords, refs, _, geom = scene
+    _, inds, box = compose_timepoint(0, lay, coords, FlatReader(), geom, refs)
+    assert box == bbox_of(inds)
+
+
+def test_an_empty_timepoint_has_no_box(scene):
+    lay, coords, refs, _, geom = scene
+    empty = type(coords)(tuple({} for _ in coords.by_time))
+    _, inds, box = compose_timepoint(0, lay, empty, FlatReader(), geom, refs)
+    assert box is None and not inds.any()
+
+
+# --- padding ------------------------------------------------------------------
+def test_scalar_pad_leaves_z_alone(scene):
+    """Padding z multiplies the canvas volume for no benefit: drift in z is tiny."""
+    lay, coords, _, _, geom = scene
+    padded = CanvasGeometry.required(
+        coords, (lay.nz, lay.ny, lay.nx), lay.nt, "uint16", pad=10
+    )
+    assert padded.spatial[0] == geom.spatial[0]
+    assert padded.spatial[1] == geom.spatial[1] + 20
+    assert padded.spatial[2] == geom.spatial[2] + 20
+    assert padded.origin[0] == geom.origin[0]
+
+
+def test_three_values_pad_each_axis(scene):
+    lay, coords, _, _, geom = scene
+    padded = CanvasGeometry.required(
+        coords, (lay.nz, lay.ny, lay.nx), lay.nt, "uint16", pad=(1, 2, 3)
+    )
+    assert padded.spatial == tuple(
+        a + 2 * b for a, b in zip(geom.spatial, (1, 2, 3), strict=False)
+    )
+    assert padded.origin == tuple(
+        a - b for a, b in zip(geom.origin, (1, 2, 3), strict=False)
+    )
+
+
+def test_no_padding_by_default(scene):
+    """The default frame is exactly the extent of the placed tiles."""
+    lay, coords, _, _, _geom = scene
+    tile = (lay.nz, lay.ny, lay.nx)
+    ext = coords.extent(tile)
+    default = CanvasGeometry.required(coords, tile, lay.nt, "uint16")
+    assert default.origin == tuple(int(v) for v in ext[:, 0])
+    assert default.spatial == tuple(int(v) for v in (ext[:, 1] - ext[:, 0]))
+    assert default.slack(coords, tile, lay.nt) == (0, 0, 0)
+
+
+# --- malformed sidecars -------------------------------------------------------
+def test_a_corrupt_geometry_sidecar_is_fatal(scene, tmp_path):
+    """Returning None here would derive a fresh frame and remap what is written."""
+    _lay, _coords, _refs, _, geom = scene
+    out = tmp_path / "canvas.zarr"
+    geom.save(out)
+    CanvasGeometry.path_for(out).write_text("{ not json")
+    with pytest.raises(CanvasMismatch, match="cannot be read"):
+        CanvasGeometry.load(out)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"origin": [0, 0]}',  # missing keys
+        '{"origin": 5, "shape": 5, "dtype": "u2"}',  # wrong types
+    ],
+)
+def test_a_malformed_geometry_sidecar_is_fatal(scene, tmp_path, body):
+    _lay, _coords, _refs, _, geom = scene
+    out = tmp_path / "canvas.zarr"
+    geom.save(out)
+    CanvasGeometry.path_for(out).write_text(body)
+    with pytest.raises(CanvasMismatch):
+        CanvasGeometry.load(out)
+
+
+def test_a_missing_sidecar_is_not_an_error(tmp_path):
+    assert CanvasGeometry.load(tmp_path / "never-written.zarr") is None
+
+
+def test_resolve_geometry_surfaces_a_corrupt_sidecar(scene, tmp_path):
+    lay, coords, _refs, _, geom = scene
+    out = tmp_path / "canvas.zarr"
+    geom.save(out)
+    CanvasGeometry.path_for(out).write_text("garbage")
+    with pytest.raises(CanvasMismatch, match="--recreate"):
+        resolve_geometry(
+            out, coords, (lay.nz, lay.ny, lay.nx), lay.nt, "uint16", 0, lay.nt
+        )
+
+
+def test_recreate_ignores_a_corrupt_sidecar(scene, tmp_path):
+    """--recreate is the documented escape hatch, so it must not trip over it."""
+    lay, coords, _refs, _, geom = scene
+    out = tmp_path / "canvas.zarr"
+    geom.save(out)
+    CanvasGeometry.path_for(out).write_text("garbage")
+    fresh, is_new = resolve_geometry(
+        out,
+        coords,
+        (lay.nz, lay.ny, lay.nx),
+        lay.nt,
+        "uint16",
+        0,
+        lay.nt,
+        recreate=True,
+    )
+    assert is_new and fresh == geom
+
+
+def test_a_torn_blend_log_line_warns_and_is_skipped(tmp_path):
+    p = tmp_path / "c.blended"
+    log = BlendLog(p)
+    log.mark(0, "abc", [[0, 1], [0, 1], [0, 1]])
+    with p.open("a") as f:
+        f.write('{"t": 1, "ke')
+    with pytest.warns(RuntimeWarning, match="skipped 1 unreadable line"):
+        reloaded = BlendLog(p)
+    assert reloaded.is_done(0, "abc")
+    assert reloaded.skipped == 1
+    assert not reloaded.written(1)
+
+
+def test_a_clean_blend_log_warns_about_nothing(tmp_path, recwarn):
+    p = tmp_path / "c.blended"
+    BlendLog(p).mark(0, "abc", None)
+    BlendLog(p)
+    assert not [w for w in recwarn if issubclass(w.category, RuntimeWarning)]

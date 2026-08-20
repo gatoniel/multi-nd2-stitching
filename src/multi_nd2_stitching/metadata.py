@@ -6,15 +6,16 @@ layer below can be tested with hand-written metadata and no microscopy files.
 
 from __future__ import annotations
 
-import json
-import logging
+import warnings
 from pathlib import Path
 
 import attrs
-import cattrs
+from cattrs.errors import BaseValidationError
 from cattrs.preconf.json import make_converter
 
-logger = logging.getLogger(__name__)
+# A cache file we cannot read: decode error, wrong type, or a schema that has
+# moved on since it was written. Never fatal -- but never silent either.
+_PARSE_ERRORS = (OSError, ValueError, KeyError, TypeError, BaseValidationError)
 
 
 @attrs.frozen
@@ -120,11 +121,14 @@ def load_metadata(paths, cache: Path | None = None) -> Metadata:
     if cache.exists():
         try:
             blob = converter.loads(cache.read_text(), MetadataCache)
-        except (json.JSONDecodeError, cattrs.errors.ClassValidationError):
+        except _PARSE_ERRORS as e:
             # Corrupt file, or a FileMeta field added since it was written.
             # A stale cache is never a reason to fail -- just re-read.
-            logger.debug(
-                "ignoring unreadable metadata cache at %s", cache, exc_info=True
+            warnings.warn(
+                f"{cache}: ignoring unreadable metadata cache "
+                f"({type(e).__name__}); re-reading the ND2 headers",
+                RuntimeWarning,
+                stacklevel=2,
             )
         else:
             if blob.stamp == stamp:

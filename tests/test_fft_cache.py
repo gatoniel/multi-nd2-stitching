@@ -2,7 +2,7 @@ from collections import Counter
 
 import numpy as np
 import pytest
-from helpers import FakeReader, build, make_meta
+from helpers import FakeReader, build, make_meta, stub_files
 
 from multi_nd2_stitching.compute import (
     Spectra,
@@ -74,9 +74,7 @@ def test_float32_finds_the_same_peak():
 
 
 def test_precision_is_part_of_the_key(cfg_dict, tmp_path):
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     meta = make_meta(n_files=2, nt=5, paths=files)
     lay = build(cfg_dict, n_files=2, nt=5, paths=files)
@@ -134,9 +132,7 @@ def test_parent_and_child_strips_are_different_entries():
 
 def test_spectrum_cache_returns_correct_results(cfg_dict, tmp_path):
     """Caching must not change a single offset."""
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     cfg_dict["shift_px"] = 3
     meta = make_meta(n_files=2, nt=5, paths=files)
@@ -154,9 +150,7 @@ def test_spectrum_cache_returns_correct_results(cfg_dict, tmp_path):
 
 def test_time_tasks_reuse_anchor_spectra(cfg_dict, tmp_path):
     """The payoff: each anchor volume is transformed once, not twice."""
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     cfg_dict["shift_px"] = 3
     meta = make_meta(n_files=2, nt=5, paths=files)
@@ -170,9 +164,7 @@ def test_time_tasks_reuse_anchor_spectra(cfg_dict, tmp_path):
 # --- concurrency --------------------------------------------------------------
 @pytest.mark.parametrize("concurrency", [1, 2, 4])
 def test_concurrency_gives_identical_results(cfg_dict, tmp_path, concurrency):
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     cfg_dict["shift_px"] = 3
     meta = make_meta(n_files=2, nt=5, paths=files)
@@ -195,9 +187,7 @@ def test_concurrency_gives_identical_results(cfg_dict, tmp_path, concurrency):
 
 
 def test_every_task_is_run_exactly_once(cfg_dict, tmp_path):
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     cfg_dict["shift_px"] = 3
     meta = make_meta(n_files=2, nt=5, paths=files)
@@ -214,12 +204,44 @@ def test_an_exception_propagates_out_of_the_pool(cfg_dict, tmp_path):
         def read(self, ref):
             raise RuntimeError("disk on fire")
 
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     cfg_dict["shift_px"] = 3
     meta = make_meta(n_files=2, nt=5, paths=files)
     plan = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
     with pytest.raises(RuntimeError, match="disk on fire"):
         run_plan(plan, OffsetStore(), Spectra(Boom()), concurrency=4)
+
+
+def test_uses_can_be_counted_over_a_subset(cfg_dict, tmp_path):
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    cfg_dict["shift_px"] = 3
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    plan = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+    subset = plan.tasks[:4]
+    assert sum(plan.spectrum_uses(subset).values()) == 2 * len(subset)
+    assert sum(plan.volume_uses(subset).values()) == 2 * len(subset)
+
+
+def test_a_resumed_run_releases_everything(cfg_dict, tmp_path):
+    """Counting the whole plan would leave spectra resident forever."""
+
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    cfg_dict["shift_px"] = 3
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    plan = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+
+    store = OffsetStore()
+    run_plan(plan, store, Spectra(FakeReader(shape=(4, 8, 8))), limit=6)
+    pending = plan.pending(store)
+
+    stale = SpectrumCache(FakeReader(shape=(4, 8, 8)), plan.spectrum_uses())
+    run_plan(plan, OffsetStore(), stale)  # counts from the whole plan
+
+    store2 = OffsetStore()
+    run_plan(plan, store2, Spectra(FakeReader(shape=(4, 8, 8))), limit=6)
+    good = SpectrumCache(FakeReader(shape=(4, 8, 8)), plan.spectrum_uses(pending))
+    run_plan(plan, store2, good)
+    assert good.resident == 0

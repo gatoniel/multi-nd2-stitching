@@ -14,20 +14,28 @@ import numpy as np
 
 
 class MissingOffsets(Exception):
-    def __init__(self, missing: list[str]):
+    def __init__(self, missing: list[str], hint: str = ""):
         self.missing = missing
         super().__init__(
-            f"{len(missing)} offset(s) not computed yet; run `stitch offsets`:\n"
+            f"{len(missing)} offset(s) not computed yet:\n"
             + "\n".join(f"  - {m}" for m in missing[:10])
             + (f"\n  ... and {len(missing) - 10} more" if len(missing) > 10 else "")
+            + (f"\n{hint}" if hint else "")
         )
 
 
 @attrs.frozen
 class Coordinates:
-    """(t, tile) -> zyx position, in a frame whose origin is arbitrary."""
+    """(t, tile) -> zyx position, in a frame whose origin is arbitrary.
+
+    `window` is the timepoint range that was actually asked for. Frames outside
+    it may be present (the drift chain has to be walked from t=0 regardless) but
+    they are placed best-effort and are excluded from `extent`, so blending a
+    prefix does not size the canvas from tiles nobody asked about.
+    """
 
     by_time: tuple[dict[str, np.ndarray], ...]
+    window: tuple[int, int] = (0, 0)
 
     def at(self, t: int) -> dict[str, np.ndarray]:
         return self.by_time[t]
@@ -36,11 +44,15 @@ class Coordinates:
         t, name = key
         return self.by_time[t][name]
 
-    def extent(self, tile_shape) -> np.ndarray:
-        """(3, 2) array of min/max over every placed tile, in zyx."""
-        placed = [c for frame in self.by_time for c in frame.values()]
+    def extent(
+        self, tile_shape, t0: int | None = None, t1: int | None = None
+    ) -> np.ndarray:
+        """(3, 2) array of min/max over placed tiles, in zyx."""
+        t0 = self.window[0] if t0 is None else t0
+        t1 = self.window[1] if t1 is None else t1
+        placed = [c for frame in self.by_time[t0:t1] for c in frame.values()]
         if not placed:
-            raise ValueError("no tiles placed")
+            raise ValueError(f"no tiles placed in t={t0}..{t1 - 1}")
         arr = np.array(placed)
         return np.stack(
             (arr.min(axis=0), arr.max(axis=0) + np.array(tile_shape)), axis=1
@@ -53,12 +65,24 @@ def _index_tasks(plan):
     return time_by, pair_by
 
 
-def build_coordinates(layout, plan, store) -> Coordinates:
+def build_coordinates(
+    layout, plan, store, t0: int = 0, t1: int | None = None
+) -> Coordinates:
+    """Place tiles for t in [t0, t1).
+
+    The drift chain is absolute: an anchor's position at t is its position at
+    t-1 plus that step's offset, so timepoints before the window still have to
+    be walked. Their *time* offsets are therefore required; their pair offsets
+    are not, and a tile that cannot be placed before the window is simply left
+    out rather than reported. Inside the window everything is required.
+    """
+    t1 = layout.nt if t1 is None else t1
     time_by, pair_by = _index_tasks(plan)
     frames: list[dict[str, np.ndarray]] = []
     missing: list[str] = []
 
-    for t in range(layout.nt):
+    for t in range(t1):
+        in_window = t >= t0
         here: dict[str, np.ndarray] = {}
 
         # --- seeds: anchors carry their own position forward through drift ---
@@ -72,7 +96,7 @@ def build_coordinates(layout, plan, store) -> Coordinates:
                 continue
             offset = store.get(task.key)
             if offset is None:
-                missing.append(task.describe())
+                missing.append(task.describe())  # drift is needed either way
                 continue
             here[name] = frames[t - 1][name] + offset.as_array()
 
@@ -88,7 +112,7 @@ def build_coordinates(layout, plan, store) -> Coordinates:
             task = pair_by.get((p.a, p.b, p.axis, t))
             offset = store.get(task.key) if task is not None else None
             if offset is None:
-                if task is not None:
+                if task is not None and in_window:
                     missing.append(task.describe())
                 stalled += 1
                 continue
@@ -106,6 +130,12 @@ def build_coordinates(layout, plan, store) -> Coordinates:
                 stalled += 1
         frames.append(here)
 
+    frames.extend({} for _ in range(layout.nt - len(frames)))
+
     if missing:
-        raise MissingOffsets(sorted(set(missing)))
-    return Coordinates(tuple(frames))
+        raise MissingOffsets(
+            sorted(set(missing)),
+            hint=f"run `stitch offsets --between {t0} {t1}` "
+            "(drift also needs every step from t=0)",
+        )
+    return Coordinates(tuple(frames), window=(t0, t1))

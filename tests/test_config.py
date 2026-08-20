@@ -1,4 +1,5 @@
 import pytest
+from cattrs.errors import BaseValidationError
 
 from multi_nd2_stitching.config import clamp_z
 
@@ -54,8 +55,10 @@ def test_overrides_null(cfg_dict, parse):
 # --- required fields must fail loudly ----------------------------------------
 @pytest.mark.parametrize("field", ["files", "grid_spacing", "positions"])
 def test_required_missing_raises(cfg_dict, parse, field):
+    """cattrs wraps per-field failures, so the concrete type varies by version;
+    what matters is that a missing required field never structures silently."""
     cfg_dict.pop(field)
-    with pytest.raises(Exception):
+    with pytest.raises((KeyError, ValueError, TypeError, BaseValidationError)):
         parse(cfg_dict)
 
 

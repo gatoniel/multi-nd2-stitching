@@ -173,3 +173,63 @@ def test_results_survive_a_crash_mid_run(tmp_path):
         run_plan(TinyPlan(tasks), store, Spectra(Boom()))
     # task 0 reads local_t 0 and 1; task 1 reads local_t 2 and dies.
     assert len(OffsetStore(path)) == 1
+
+
+class Bar:
+    """A tqdm-shaped stand-in that records whether it was closed."""
+
+    def __init__(self, xs):
+        self.xs = list(xs)
+        self.closed = False
+        self.updates = 0
+
+    def __iter__(self):
+        return iter(self.xs)
+
+    def update(self, n):
+        self.updates += n
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("concurrency", [1, 3])
+def test_progress_bar_is_closed_on_failure(tmp_path, concurrency):
+    """An unclosed tqdm finalises at interpreter shutdown and hides the real error."""
+    bars = []
+
+    def progress(xs):
+        bars.append(Bar(xs))
+        return bars[-1]
+
+    class Boom(FakeReader):
+        def read(self, ref):
+            raise RuntimeError("mount died")
+
+    with pytest.raises(RuntimeError, match="mount died"):
+        run_plan(
+            TinyPlan(_tasks(4)),
+            OffsetStore(),
+            Spectra(Boom()),
+            concurrency=concurrency,
+            progress=progress,
+        )
+    assert bars and bars[0].closed
+
+
+@pytest.mark.parametrize("concurrency", [1, 3])
+def test_progress_bar_is_closed_on_success(tmp_path, concurrency):
+    bars = []
+
+    def progress(xs):
+        bars.append(Bar(xs))
+        return bars[-1]
+
+    run_plan(
+        TinyPlan(_tasks(4)),
+        OffsetStore(),
+        Spectra(FakeReader()),
+        concurrency=concurrency,
+        progress=progress,
+    )
+    assert bars[0].closed

@@ -20,18 +20,10 @@ def make_meta(
     voxel=0.1,
     paths=None,
 ):
-    """Synthetic ND2 metadata: `tiles` laid out in a line, `spacing` um apart.
-
-    This is the whole point of splitting metadata from geometry -- the layout
-    layer is exercised without a single .nd2 file.
-    """
     stage = [
         (i * spacing, 0.0) if axis == "x" else (0.0, i * spacing)
         for i, _ in enumerate(tiles)
     ]
-
-    for i, _ in enumerate(tiles):
-        stage.append((i * spacing, 0.0) if axis == "x" else (0.0, i * spacing))
     return Metadata(
         tuple(
             FileMeta(
@@ -69,3 +61,18 @@ class FakeReader:
         self.reads.append(ref)
         dz, dy, dx = self.shifts.get(ref, (0, 0, 0))
         return np.roll(self.base, (dz, dy, dx), axis=(0, 1, 2))
+
+
+def stub_files(tmp_path, n=2, prefix="f", size=100):
+    """Create `n` placeholder .nd2 files and return their paths as strings.
+
+    build_plan stamps each file's (path, size, mtime) into its cache keys, so
+    the paths in a config have to exist even when the ND2 content is faked.
+    Sizes differ per file so the stamps do too.
+    """
+    out = []
+    for i in range(n):
+        p = tmp_path / f"{prefix}{i}.nd2"
+        p.write_bytes(b"x" * (size + i))
+        out.append(str(p))
+    return out

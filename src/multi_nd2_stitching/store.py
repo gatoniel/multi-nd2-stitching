@@ -11,9 +11,14 @@ record, not decode an .npy.
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import attrs
+
+# A malformed JSONL line: decode error, missing key, or wrong type. Anything
+# else is our own bug and must not be swallowed.
+_PARSE_ERRORS = (OSError, ValueError, KeyError, TypeError)
 
 
 @attrs.frozen
@@ -56,9 +61,16 @@ class OffsetStore:
                     rec = json.loads(line)
                     self._data[rec["key"]] = Offset(**rec["offset"])
                     self._meta[rec["key"]] = rec.get("task", {})
-                except Exception:
+                except _PARSE_ERRORS:
                     skipped += 1  # torn final line from a killed process
         self.skipped = skipped
+        if skipped:
+            warnings.warn(
+                f"{self.path}: skipped {skipped} unreadable line(s); those "
+                "offsets will be recomputed",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     # --- mapping-ish ------------------------------------------------------
     def __contains__(self, key: str) -> bool:

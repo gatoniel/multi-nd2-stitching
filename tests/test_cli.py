@@ -204,7 +204,7 @@ def test_metadata_cache_is_written_and_reused(project, monkeypatch):
 def test_changing_precision_invalidates(project, capsys):
     run("offsets", project, "--no-progress")
     capsys.readouterr()
-    run("status", project, "--precision", "float32")
+    run("status", project, "--precision", "float64")
     assert "cached     0" in capsys.readouterr().out
 
 
@@ -229,7 +229,7 @@ def test_show_names_both_kinds(project, capsys):
 # --- blend --------------------------------------------------------------------
 def test_blend_refuses_without_offsets(project, capsys):
     assert run("blend", project) == 1
-    assert "run `stitch offsets`" in capsys.readouterr().err
+    assert "stitch offsets --between" in capsys.readouterr().err
 
 
 def test_blend_writes_to_a_chosen_output(project, tmp_path, capsys):
@@ -346,3 +346,373 @@ def test_blend_refuses_a_tile_that_no_longer_fits(project, tmp_path, capsys):
     capsys.readouterr()
     assert run("blend", project, "--output", out, "--no-progress", "--force") == 1
     assert "no longer fit" in capsys.readouterr().err
+
+
+# --- blending a prefix --------------------------------------------------------
+def test_blend_a_prefix_before_everything_is_computed(project, tmp_path, capsys):
+    """The point of the exercise: look at the first stretch early."""
+    run("offsets", project, "--between", 0, 4, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "canvas.zarr"
+    assert (
+        run(
+            "blend",
+            project,
+            "--output",
+            out,
+            "--between",
+            0,
+            4,
+            "--pad",
+            16,
+            "--no-progress",
+        )
+        == 0
+    )
+    text = capsys.readouterr().out
+    assert "wrote      4 timepoint(s)" in text
+    assert out.exists()
+
+
+def test_blending_past_the_computed_range_still_refuses(project, tmp_path, capsys):
+    run("offsets", project, "--between", 0, 4, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "canvas.zarr"
+    assert run("blend", project, "--output", out, "--no-progress") == 1
+    assert "not computed yet" in capsys.readouterr().err
+
+
+def test_pad_leaves_room_for_the_rest_of_the_run(project, tmp_path, capsys):
+    """Without --pad the prefix's tight frame would reject later timepoints."""
+    run("offsets", project, "--between", 0, 4, "--no-progress")
+    out = tmp_path / "canvas.zarr"
+    run(
+        "blend",
+        project,
+        "--output",
+        out,
+        "--between",
+        0,
+        4,
+        "--pad",
+        16,
+        "--no-progress",
+    )
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    assert run("blend", project, "--output", out, "--no-progress") == 0
+    text = capsys.readouterr().out
+    assert "existing frame" in text
+    assert "wrote      4 timepoint(s)" in text, "the first four stay cached"
+
+
+def test_pad_widens_the_new_canvas(project, tmp_path, capsys):
+    import json
+
+    run("offsets", project, "--no-progress")
+    a = tmp_path / "a.zarr"
+    b = tmp_path / "b.zarr"
+    run("blend", project, "--output", a, "--no-progress")
+    run("blend", project, "--output", b, "--pad", 10, "--no-progress")
+    sa = json.loads((tmp_path / "a.zarr.geometry.json").read_text())
+    sb = json.loads((tmp_path / "b.zarr.geometry.json").read_text())
+    assert sb["shape"][3] == sa["shape"][3] + 20
+    assert sb["origin"][2] == sa["origin"][2] - 10
+
+
+# --- inspect ------------------------------------------------------------------
+def test_inspect_writes_arrays_napari_can_open(project, tmp_path, capsys):
+    import json
+
+    import zarr
+
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "look"
+    assert run("inspect", project, "--at", 1, "--out", out) == 0
+    text = capsys.readouterr().out
+    assert "vs nominal" in text and "napari" in text
+    d = next((out / "t1").iterdir())
+    for name in ("measured", "nominal", "overlap", "response"):
+        assert zarr.open(str(d / f"{name}.zarr"), mode="r").shape
+    info = json.loads((d / "info.json").read_text())
+    assert info["t"] == 1 and len(info["measured_offset"]) == 3
+
+
+def test_inspect_measured_has_two_layers(project, tmp_path):
+    import zarr
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "look"
+    run("inspect", project, "--at", 1, "--out", out)
+    d = next((out / "t1").iterdir())
+    arr = zarr.open(str(d / "measured.zarr"), mode="r")
+    assert arr.shape[0] == 2, "layer 0 = a, layer 1 = b"
+
+
+def test_inspect_reports_the_correction(project, tmp_path, capsys):
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    run("inspect", project, "--at", 1, "--out", tmp_path / "look")
+    assert "delta=" in capsys.readouterr().out
+
+
+def test_inspect_needs_the_offsets_first(project, tmp_path, capsys):
+    assert run("inspect", project, "--at", 1, "--out", tmp_path / "look") == 1
+    assert "not computed" in capsys.readouterr().err
+
+
+def test_inspect_unknown_pair_lists_the_tiles(project, tmp_path, capsys):
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    assert (
+        run(
+            "inspect",
+            project,
+            "--at",
+            1,
+            "--pair",
+            "nope,alsonope",
+            "--out",
+            tmp_path / "look",
+        )
+        == 1
+    )
+    assert "tiles here:" in capsys.readouterr().err
+
+
+def test_no_response_skips_that_array(project, tmp_path):
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "look"
+    run("inspect", project, "--at", 1, "--out", out, "--no-response")
+    d = next((out / "t1").iterdir())
+    assert not (d / "response.zarr").exists()
+    assert (d / "measured.zarr").exists()
+
+
+def test_blend_default_canvas_is_tight(project, tmp_path, capsys):
+    """No --pad means no slack line and no wasted canvas."""
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "canvas.zarr"
+    run("blend", project, "--output", out, "--no-progress")
+    text = capsys.readouterr().out
+    assert "slack" not in text
+
+
+def test_a_padded_canvas_persists_until_recreated(project, tmp_path, capsys):
+    """The frame is fixed at creation, so dropping --pad later changes nothing."""
+    import json
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "canvas.zarr"
+    run("blend", project, "--output", out, "--pad", 20, "--no-progress")
+    padded = json.loads((tmp_path / "canvas.zarr.geometry.json").read_text())["shape"]
+
+    capsys.readouterr()
+    run("blend", project, "--output", out, "--no-progress", "--force")
+    assert (
+        json.loads((tmp_path / "canvas.zarr.geometry.json").read_text())["shape"]
+        == padded
+    )
+    assert "slack" in capsys.readouterr().out
+
+    run("blend", project, "--output", out, "--recreate", "--no-progress")
+    tight = json.loads((tmp_path / "canvas.zarr.geometry.json").read_text())["shape"]
+    assert tight[2] == padded[2] - 40 and tight[3] == padded[3] - 40
+
+
+# --- drift --------------------------------------------------------------------
+def test_drift_writes_the_stacks_and_the_table(project, tmp_path, capsys):
+    import zarr
+
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "drift"
+    assert run("drift", project, "--tile", "tile_a", "--out", out, "--no-progress") == 0
+    text = capsys.readouterr().out
+    assert "median" in text and "napari" in text
+    for name in ("aligned_xy", "aligned_zx", "raw_xy", "response"):
+        assert zarr.open(str(out / f"{name}.zarr"), mode="r").shape
+    rows = (out / "offsets.csv").read_text().strip().splitlines()
+    assert rows[0].startswith("t,dz,dy,dx")
+    assert len(rows) == 8, "one header plus one row per step"
+
+
+def test_drift_stacks_are_one_frame_longer_than_the_steps(project, tmp_path):
+    import zarr
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "drift"
+    run("drift", project, "--tile", "tile_a", "--out", out, "--no-progress")
+    aligned = zarr.open(str(out / "aligned_xy.zarr"), mode="r")
+    response = zarr.open(str(out / "response.zarr"), mode="r")
+    assert aligned.shape[0] == response.shape[0] + 1
+
+
+def test_drift_canvas_is_wider_than_the_tile_when_it_moves(project, tmp_path):
+    import json
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "drift"
+    run("drift", project, "--tile", "tile_a", "--out", out, "--no-progress")
+    info = json.loads((out / "info.json").read_text())
+    assert info["tile"] == "tile_a"
+    assert len(info["total_drift"]) == 3
+    assert info["canvas"][1] >= info["tile_shape"][1]
+
+
+def test_drift_full_writes_a_4d_stack(project, tmp_path):
+    import zarr
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "drift"
+    run("drift", project, "--tile", "tile_a", "--out", out, "--full", "--no-progress")
+    assert zarr.open(str(out / "aligned.zarr"), mode="r").ndim == 4
+    assert not (out / "aligned_xy.zarr").exists()
+
+
+def test_drift_between_limits_the_steps(project, tmp_path, capsys):
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "drift"
+    run(
+        "drift",
+        project,
+        "--tile",
+        "tile_a",
+        "--between",
+        2,
+        5,
+        "--out",
+        out,
+        "--no-progress",
+    )
+    assert "steps      3" in capsys.readouterr().out
+
+
+def test_drift_needs_the_offsets(project, tmp_path, capsys):
+    assert (
+        run(
+            "drift",
+            project,
+            "--tile",
+            "tile_a",
+            "--out",
+            tmp_path / "d",
+            "--no-progress",
+        )
+        == 1
+    )
+    assert "not computed" in capsys.readouterr().err
+
+
+def test_drift_on_a_non_anchor_lists_the_anchors(project, tmp_path, capsys):
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    assert (
+        run(
+            "drift",
+            project,
+            "--tile",
+            "tile_b",
+            "--out",
+            tmp_path / "d",
+            "--no-progress",
+        )
+        == 1
+    )
+    assert "anchors are ['tile_a']" in capsys.readouterr().err
+
+
+def test_drift_flags_an_outlier_step(project, tmp_path, capsys, monkeypatch):
+    """A single large jump should be called out before anything is written."""
+    from multi_nd2_stitching.offsets import build_plan as real_build
+
+    run("offsets", project, "--no-progress")
+
+    from multi_nd2_stitching.store import Offset
+    from multi_nd2_stitching.store import OffsetStore as RealStore
+    from multi_nd2_stitching.workspace import Workspace
+
+    ws = Workspace.of(project)
+    plan_store = RealStore(ws.offsets)
+    # overwrite one drift step with a big jump
+    from multi_nd2_stitching.config import load_config
+    from multi_nd2_stitching.layout import build_layout
+    from multi_nd2_stitching.metadata import load_metadata
+
+    cfg = load_config(ws.config_path)
+    meta = load_metadata(cfg.files, cache=ws.metadata)
+    plan = real_build(build_layout(cfg, meta), meta)
+    target = sorted(plan.time_tasks, key=lambda t: t.t_to)[3]
+    plan_store.put(target, Offset(0, 400, 0))
+
+    capsys.readouterr()
+    run("drift", project, "--tile", "tile_a", "--out", tmp_path / "d", "--no-progress")
+    text = capsys.readouterr().out
+    assert "outliers   1" in text
+    assert f"t={target.t_to}" in text
+
+
+# --- timeline -----------------------------------------------------------------
+def test_timeline_lists_every_file(project, capsys):
+    assert run("timeline", project) == 0
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.strip()]
+    assert "timepoints" in lines[0]
+    assert "0..3" in out and "4..7" in out
+    assert "total" in out
+
+
+def test_timeline_shows_anchors_per_file(project, capsys):
+    run("timeline", project)
+    assert "tile_a" in capsys.readouterr().out
+
+
+def test_timeline_at_resolves_a_global_timepoint(project, capsys):
+    assert run("timeline", project, "--at", 5) == 0
+    out = capsys.readouterr().out
+    assert "t=5" in out and "file 1, timepoint 1" in out
+    assert "tiles" in out and "anchors" in out
+
+
+@pytest.mark.parametrize(
+    "t,expected",
+    [
+        (0, "file 0, timepoint 0"),
+        (3, "file 0, timepoint 3"),
+        (4, "file 1, timepoint 0"),
+        (7, "file 1, timepoint 3"),
+    ],
+)
+def test_timeline_at_boundaries(project, capsys, t, expected):
+    run("timeline", project, "--at", t)
+    assert expected in capsys.readouterr().out
+
+
+def test_timeline_at_out_of_range(project, capsys):
+    assert run("timeline", project, "--at", 99) == 1
+    assert "outside the timeline" in capsys.readouterr().err
+
+
+# --- precision default --------------------------------------------------------
+def test_float32_is_the_default(project, capsys):
+    """Explicitly float32 must be a no-op against a default run."""
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    run("status", project, "--precision", "float32")
+    out = capsys.readouterr().out
+    assert "pending 0" in out
+
+
+def test_library_and_cli_defaults_agree():
+    """A mismatch here silently makes library-built plans miss the CLI's cache."""
+    import inspect as _inspect
+
+    from multi_nd2_stitching.cli import build_parser
+    from multi_nd2_stitching.offsets import build_plan
+
+    cli_default = build_parser().parse_args(["status", "x.yaml"]).precision
+    lib_default = _inspect.signature(build_plan).parameters["precision"].default
+    assert cli_default == lib_default == "float32"

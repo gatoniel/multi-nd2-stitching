@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import warnings
 from pathlib import Path
 
 import attrs
@@ -28,6 +29,12 @@ class CanvasMismatch(Exception):
     pass
 
 
+# What a malformed JSON sidecar or log line can actually raise: a read error, a
+# decode error, a missing key, or a field of the wrong type. Anything outside
+# this set is a bug in our own code and should not be swallowed.
+_PARSE_ERRORS = (OSError, ValueError, KeyError, TypeError)
+
+
 @attrs.frozen
 class CanvasGeometry:
     """Where world coordinates land in the canvas. Immutable once written."""
@@ -37,10 +44,33 @@ class CanvasGeometry:
     dtype: str
 
     @classmethod
-    def required(cls, coords: Coordinates, tile_shape, nt: int, dtype: str):
-        ext = coords.extent(tile_shape)
-        origin = tuple(int(v) for v in ext[:, 0])
-        size = tuple(int(v) for v in (ext[:, 1] - ext[:, 0]))
+    def required(
+        cls,
+        coords: Coordinates,
+        tile_shape,
+        nt: int,
+        dtype: str,
+        t0: int | None = None,
+        t1: int | None = None,
+        pad=0,
+    ):
+        """Tight frame around the placed tiles, optionally padded.
+
+        `pad` buys room for timepoints not yet computed: without it, a canvas
+        created from a prefix will almost certainly be too small once the rest
+        of the run drifts, forcing --recreate. It may be one number (applied to
+        y and x only) or three (z, y, x). Padding z is almost never wanted --
+        the stack is shallow and drifts little, so it mostly multiplies the
+        canvas volume.
+        """
+        pads = (
+            (0, int(pad), int(pad)) if np.isscalar(pad) else tuple(int(v) for v in pad)
+        )
+        ext = coords.extent(tile_shape, t0, t1)
+        origin = tuple(int(v) - p for v, p in zip(ext[:, 0], pads, strict=False))
+        size = tuple(
+            int(v) + 2 * p for v, p in zip(ext[:, 1] - ext[:, 0], pads, strict=False)
+        )
         return cls(origin=origin, shape=(nt, *size), dtype=dtype)
 
     @property
@@ -64,10 +94,19 @@ class CanvasGeometry:
                     )
         return out
 
-    def slack(self, coords: Coordinates, tile_shape, nt: int) -> tuple[int, ...]:
+    def slack(
+        self,
+        coords: Coordinates,
+        tile_shape,
+        nt: int,
+        t0: int | None = None,
+        t1: int | None = None,
+    ) -> tuple[int, ...]:
         """How much bigger this canvas is than the coordinates now need."""
-        need = CanvasGeometry.required(coords, tile_shape, nt, self.dtype)
-        return tuple(int(a - b) for a, b in zip(self.spatial, need.spatial))
+        need = CanvasGeometry.required(coords, tile_shape, nt, self.dtype, t0, t1)
+        return tuple(
+            int(a - b) for a, b in zip(self.spatial, need.spatial, strict=False)
+        )
 
     # --- persistence ------------------------------------------------------
     @staticmethod
@@ -81,6 +120,13 @@ class CanvasGeometry:
 
     @classmethod
     def load(cls, output) -> CanvasGeometry | None:
+        """The canvas's own frame, or None if it has never been written.
+
+        A sidecar that exists but cannot be read is an error, not a miss.
+        Returning None there would derive a fresh frame and silently remap every
+        timepoint already on the canvas -- exactly the failure this file exists
+        to prevent.
+        """
         p = cls.path_for(output)
         if not p.exists():
             return None
@@ -89,15 +135,24 @@ class CanvasGeometry:
             return cls(
                 origin=tuple(d["origin"]), shape=tuple(d["shape"]), dtype=d["dtype"]
             )
-        except Exception:
-            return None
+        except _PARSE_ERRORS as e:
+            raise CanvasMismatch(
+                f"{p} exists but cannot be read ({type(e).__name__}: {e}). "
+                "The canvas frame is unknown, so writing to it would misplace "
+                "the timepoints already there. Fix the file, or use --recreate "
+                "to discard the canvas and start again."
+            ) from e
 
 
-def resolve_geometry(output, coords, tile_shape, nt, dtype, t0, t1, recreate=False):
+def resolve_geometry(
+    output, coords, tile_shape, nt, dtype, t0, t1, recreate=False, pad=0
+):
     """Reuse the canvas's own geometry if it has one; otherwise derive a new one."""
     existing = None if recreate else CanvasGeometry.load(output)
     if existing is None:
-        return CanvasGeometry.required(coords, tile_shape, nt, dtype), True
+        return CanvasGeometry.required(
+            coords, tile_shape, nt, dtype, t0, t1, pad=pad
+        ), True
     if existing.dtype != dtype:
         raise CanvasMismatch(
             f"canvas at {output} was written as {existing.dtype}, not {dtype}. "
@@ -147,7 +202,16 @@ def blend_weights(name: str, t: int, coords: Coordinates, pairs, tile_shape):
 
 
 def compose_timepoint(t, layout, coords, reader, geometry: CanvasGeometry, refs):
-    """Blend one timepoint into a float32 array. Returns (image, mask)."""
+    """Blend one timepoint. Returns (image, mask, bbox).
+
+    Every whole-canvas pass is confined to the covered bounding box. The tiles
+    at one timepoint occupy a small part of a padded canvas, and a full-canvas
+    normalise costs in proportion to the canvas rather than to the data: on a
+    generously padded extent that alone was ~20x the useful work.
+
+    The buffers are freshly allocated each call on purpose -- np.zeros hands
+    back lazily-zeroed pages, so the padding we never touch costs nothing.
+    """
     out_shape = geometry.spatial
     accum = np.zeros(out_shape, dtype=np.float32)
     counts = np.zeros(out_shape, dtype=np.float32)
@@ -170,8 +234,11 @@ def compose_timepoint(t, layout, coords, reader, geometry: CanvasGeometry, refs)
         counts[sls] += weights
         inds[sls] = True
 
-    np.divide(accum, counts, out=accum, where=inds)
-    return accum, inds
+    box = bbox_of(inds)
+    if box is not None:
+        sl = tuple(slice(*b) for b in box)
+        np.divide(accum[sl], counts[sl], out=accum[sl], where=inds[sl])
+    return accum, inds, box
 
 
 def bbox_of(inds) -> list[list[int]] | None:
@@ -194,6 +261,29 @@ def union_bbox(a, b):
     return [[min(a[i][0], b[i][0]), max(a[i][1], b[i][1])] for i in range(3)]
 
 
+def snap_to_chunks(region, chunk_zyx, shape_zyx):
+    """Grow a bbox out to chunk boundaries.
+
+    Writing a slice that starts mid-chunk forces zarr to read-modify-write every
+    partial chunk, and neighbouring writes then hit the same chunk repeatedly.
+    Measured at ~3x slower than aligned writes even without compression.
+    """
+    if region is None:
+        return None
+    out = []
+    for axis in range(3):
+        lo, hi = region[axis]
+        step = chunk_zyx[axis]
+        out.append([(lo // step) * step, min(-(-hi // step) * step, shape_zyx[axis])])
+    return out
+
+
+def overlaps(sl, bbox) -> bool:
+    if bbox is None:
+        return False
+    return all(sl[a].start < bbox[a][1] and bbox[a][0] < sl[a].stop for a in range(3))
+
+
 # --- the resume log -----------------------------------------------------------
 class BlendLog:
     """Which timepoints are on the canvas, under which placement.
@@ -207,6 +297,7 @@ class BlendLog:
         self.path = Path(path) if path is not None else None
         self._done: dict[int, str] = {}
         self._bbox: dict[int, list] = {}
+        self.skipped = 0
         if self.path is not None and self.path.exists():
             for line in self.path.read_text().splitlines():
                 if not line.strip():
@@ -215,8 +306,18 @@ class BlendLog:
                     rec = json.loads(line)
                     self._done[rec["t"]] = rec["key"]
                     self._bbox[rec["t"]] = rec.get("bbox")
-                except Exception:
-                    pass
+                except _PARSE_ERRORS:
+                    # A killed process can leave a half-written final line.
+                    # Dropping it is right; doing so silently is not -- a run
+                    # that quietly re-blends work would look like a hang.
+                    self.skipped += 1
+            if self.skipped:
+                warnings.warn(
+                    f"{self.path}: skipped {self.skipped} unreadable line(s); "
+                    "those timepoints will be blended again",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     def key(self, t: int, coords: Coordinates, geometry: CanvasGeometry) -> str:
         payload = {
@@ -296,28 +397,34 @@ def blend(
     ]
     it = progress(todo) if progress is not None else todo
 
+    spatial = geometry.spatial
+    chunk_zyx = chunk[1:]
     written = 0
     for t in it:
-        image, inds = compose_timepoint(t, layout, coords, reader, geometry, refs)
-        block = image.astype(geometry.dtype)
-        new_bbox = bbox_of(inds)
+        image, inds, new_bbox = compose_timepoint(
+            t, layout, coords, reader, geometry, refs
+        )
         # Rewriting: also cover whatever the previous pass wrote, so stale pixels
         # outside the new footprint are erased rather than left behind.
-        region = union_bbox(new_bbox, log.bbox(t) if log.written(t) else None)
+        stale = log.bbox(t) if log.written(t) else None
+        region = snap_to_chunks(union_bbox(new_bbox, stale), chunk_zyx, spatial)
 
-        def put(t=t, block=block, inds=inds, region=region):
+        def put(t=t, image=image, inds=inds, region=region, stale=stale):
             if region is None:
                 return
             (z0, z1), (y0, y1), (x0, x1) = region
-            for z in range(z0, z1, chunk[1]):
-                for y in range(y0, y1, chunk[2]):
-                    for x in range(x0, x1, chunk[3]):
+            for z in range(z0, z1, chunk_zyx[0]):
+                for y in range(y0, y1, chunk_zyx[1]):
+                    for x in range(x0, x1, chunk_zyx[2]):
                         sl = (
-                            slice(z, min(z + chunk[1], z1)),
-                            slice(y, min(y + chunk[2], y1)),
-                            slice(x, min(x + chunk[3], x1)),
+                            slice(z, min(z + chunk_zyx[0], z1)),
+                            slice(y, min(y + chunk_zyx[1], y1)),
+                            slice(x, min(x + chunk_zyx[2], x1)),
                         )
-                        canvas[(t, *sl)] = block[sl]
+                        # Skip chunks with nothing in them, unless the previous
+                        # pass wrote there and they now need clearing.
+                        if inds[sl].any() or overlaps(sl, stale):
+                            canvas[(t, *sl)] = image[sl].astype(geometry.dtype)
 
         write_with_retry(put, attempts=attempts)
         log.mark(t, log.key(t, coords, geometry), new_bbox)

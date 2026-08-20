@@ -1,5 +1,7 @@
+from pathlib import Path
+
 import pytest
-from helpers import build, make_meta
+from helpers import build, make_meta, stub_files
 
 from multi_nd2_stitching.offsets import Crop, build_plan
 from multi_nd2_stitching.store import Offset, OffsetStore
@@ -7,11 +9,7 @@ from multi_nd2_stitching.store import Offset, OffsetStore
 
 @pytest.fixture
 def plan(cfg_dict, tmp_path):
-    files = []
-    for i in range(2):
-        p = tmp_path / f"f{i}.nd2"
-        p.write_bytes(b"x" * (100 + i))
-        files.append(str(p))
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     meta = make_meta(n_files=2, nt=5, paths=files)
     return (
@@ -35,9 +33,7 @@ def test_time_task_only_for_anchors_with_a_predecessor(plan):
 
 
 def test_dropped_tile_removes_its_tasks(cfg_dict, tmp_path):
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     cfg_dict["overrides"] = [{"at": 3, "drop": ["tile_b"]}]
     meta = make_meta(n_files=2, nt=5, paths=files)
@@ -47,9 +43,7 @@ def test_dropped_tile_removes_its_tasks(cfg_dict, tmp_path):
 
 
 def test_realign_flag_and_crop(cfg_dict, tmp_path):
-    files = [str(tmp_path / f"f{i}.nd2") for i in range(2)]
-    for f in files:
-        open(f, "wb").write(b"x")
+    files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files
     cfg_dict["slices"] = {"z": [0, 20]}
     cfg_dict["realignment_slices"] = {"z": [5, 15]}
@@ -112,7 +106,7 @@ def test_unrelated_config_change_keeps_keys(plan):
 
 def test_rewriting_a_file_invalidates_its_keys(plan, tmp_path):
     p, cfg, meta = plan
-    open(cfg["files"][0], "wb").write(b"y" * 9999)
+    Path(cfg["files"][0]).write_bytes(b"y" * 9999)
     q = build_plan(build(cfg, n_files=2, nt=5, paths=cfg["files"]), meta)
     changed = {t.key for t in q.tasks} - {t.key for t in p.tasks}
     assert changed, "a rewritten ND2 must invalidate the offsets read from it"

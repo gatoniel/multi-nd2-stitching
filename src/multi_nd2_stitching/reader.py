@@ -34,40 +34,103 @@ class Nd2Reader:
         nz: int,
         ny: int,
         nx: int,
-        handles: int = 10,
+        handles: int | None = None,
         threads: int = 10,
+        max_open_files: int = 2,
     ):
         self.nz, self.ny, self.nx = nz, ny, nx
         self.threads = threads
         self._by_key = {k: i for i, k in enumerate(file_keys)}
         self._paths = list(paths)
-        self._handles = handles
+        # One handle per reader thread, plus slack. Fewer handles than threads
+        # only makes threads queue up behind each other.
+        self._handles = threads + 2 if handles is None else handles
         self._stack: ExitStack | None = None
         self._pools: dict[int, Queue] = {}
         self._dtype: dict[int, object] = {}
+        self._has_t: dict[int, bool] = {}
+        # A handle reserved for coordinate lookups, never in the pool. Peeking
+        # into the pool is not safe: with concurrency > 1 every handle can be
+        # checked out, and `pool.queue[0]` then raises IndexError.
+        self._index_handle: dict[int, object] = {}
+        self._index_lock = threading.Lock()
+        self._open_lock = threading.RLock()
+        self._lru: list[int] = []
+        self._active: Counter = Counter()
+        self.max_open_files = max_open_files
         self._executor: ThreadPoolExecutor | None = None
 
     # --- lifecycle: explicit, so no __del__ runs at interpreter shutdown ---
     def __enter__(self) -> Self:
-        import nd2
-
         self._stack = ExitStack()
         self._executor = self._stack.enter_context(
             ThreadPoolExecutor(max_workers=self.threads)
         )
-        for i, path in enumerate(self._paths):
-            pool: Queue = Queue()
-            for _ in range(self._handles):
-                pool.put(self._stack.enter_context(nd2.ND2File(str(path))))
-            self._pools[i] = pool
-            probe = pool.queue[0]
-            self._dtype[i] = probe.dtype
         return self
 
+    def _acquire(self, file_i: int) -> None:
+        """Open one file's handles on first use and mark it in use.
+
+        Opening and claiming happen under one lock acquisition: doing them
+        separately leaves a window in which another thread can evict the file
+        between the two, and the caller then reads from handles that are gone.
+
+        Opening every file up front means handles x files descriptors live at
+        once -- for nine files that was over a hundred open ND2 objects, each
+        with its own buffers, competing for page cache on a network share. Work
+        is ordered by timepoint, so only one or two files are ever in play.
+        """
+        import nd2
+
+        with self._open_lock:
+            if file_i in self._pools:
+                self._lru.remove(file_i)
+                self._lru.append(file_i)
+                self._active[file_i] += 1
+                return
+            path = self._paths[file_i]
+            probe = nd2.ND2File(str(path))
+            pool: Queue = Queue()
+            for _ in range(self._handles):
+                pool.put(nd2.ND2File(str(path)))
+            self._pools[file_i] = pool
+            self._index_handle[file_i] = probe
+            self._dtype[file_i] = probe.dtype
+            self._has_t[file_i] = "T" in probe.sizes
+            self._lru.append(file_i)
+            self._active[file_i] += 1
+            self._evict_locked()
+
+    def _release(self, file_i: int) -> None:
+        with self._open_lock:
+            self._active[file_i] -= 1
+
+    def _evict_locked(self) -> None:
+        """Close files nobody is reading from, oldest first."""
+        while len(self._pools) > self.max_open_files:
+            victim = next((f for f in self._lru if not self._active[f]), None)
+            if victim is None:
+                return  # all in use; try again next time
+            self._lru.remove(victim)
+            pool = self._pools.pop(victim)
+            while not pool.empty():
+                pool.get().close()
+            self._index_handle.pop(victim).close()
+            self._dtype.pop(victim, None)
+            self._has_t.pop(victim, None)
+
     def __exit__(self, *exc) -> None:
+        with self._open_lock:
+            for pool in self._pools.values():
+                while not pool.empty():
+                    pool.get().close()
+            for handle in self._index_handle.values():
+                handle.close()
+            self._pools.clear()
+            self._index_handle.clear()
+            self._lru.clear()
         self._stack.close()
         self._stack = None
-        self._pools.clear()
 
     # --- reading ----------------------------------------------------------
     def _frame(self, file_i: int, index: int):
@@ -78,23 +141,30 @@ class Nd2Reader:
         finally:
             pool.put(handle)
 
+    def _first_frame_index(self, file_i: int, ref: VolumeRef) -> int:
+        coords = (
+            (ref.local_t, ref.position, 0) if self._has_t[file_i] else (ref.position, 0)
+        )
+        with self._index_lock:
+            return self._index_handle[file_i]._seq_index_from_coords(coords)
+
     def read(self, ref: VolumeRef) -> np.ndarray:
         if self._stack is None:
             raise RuntimeError("Nd2Reader must be used as a context manager")
         file_i = self._by_key[ref.file]
-        handle = self._pools[file_i].queue[0]
-        if "T" in handle.sizes:
-            start = handle._seq_index_from_coords((ref.local_t, ref.position, 0))
-        else:
-            start = handle._seq_index_from_coords((ref.position, 0))
-
-        arr = np.empty((ref.nz, self.ny, self.nx), dtype=self._dtype[file_i])
-        futures = [
-            self._executor.submit(self._frame, file_i, start + z) for z in range(ref.nz)
-        ]
-        for z, fut in enumerate(futures):
-            arr[z] = fut.result()
-        return arr
+        self._acquire(file_i)
+        try:
+            start = self._first_frame_index(file_i, ref)
+            arr = np.empty((ref.nz, self.ny, self.nx), dtype=self._dtype[file_i])
+            futures = [
+                self._executor.submit(self._frame, file_i, start + z)
+                for z in range(ref.nz)
+            ]
+            for z, fut in enumerate(futures):
+                arr[z] = fut.result()
+            return arr
+        finally:
+            self._release(file_i)
 
 
 class VolumeCache:

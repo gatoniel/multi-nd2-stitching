@@ -141,9 +141,14 @@ def run_plan(
     if concurrency <= 1:
         it = progress(pending) if progress is not None else pending
         done = 0
-        for task in it:
-            store.put(task, run_task(task, spectra, workers=workers))
-            done += 1
+        try:
+            for task in it:
+                store.put(task, run_task(task, spectra, workers=workers))
+                done += 1
+        finally:
+            close = getattr(it, "close", None)
+            if close is not None:
+                close()
         return done
 
     lock = threading.Lock()
@@ -156,19 +161,26 @@ def run_plan(
             store.put(task, offset)
         return task
 
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        queue = deque(pending)
-        running = {
-            ex.submit(work, queue.popleft())
-            for _ in range(min(concurrency, len(queue)))
-        }
-        while running:
-            finished, running = wait(running, return_when=FIRST_COMPLETED)
-            for fut in finished:
-                fut.result()  # re-raise inside the caller's thread
-                done += 1
-                if tracker is not None:
-                    tracker.update(1)
-            while queue and len(running) < concurrency:
-                running.add(ex.submit(work, queue.popleft()))
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            queue = deque(pending)
+            running = {
+                ex.submit(work, queue.popleft())
+                for _ in range(min(concurrency, len(queue)))
+            }
+            while running:
+                finished, running = wait(running, return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    fut.result()  # re-raise inside the caller's thread
+                    done += 1
+                    if tracker is not None:
+                        tracker.update(1)
+                while queue and len(running) < concurrency:
+                    running.add(ex.submit(work, queue.popleft()))
+    finally:
+        # Close the bar here, or tqdm's __del__ runs during interpreter
+        # shutdown and buries the real traceback under an ImportError.
+        close = getattr(tracker, "close", None)
+        if close is not None:
+            close()
     return done

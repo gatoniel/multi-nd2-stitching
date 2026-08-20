@@ -70,6 +70,48 @@ def cmd_validate(args) -> int:
     return 0
 
 
+def cmd_timeline(args) -> int:
+    _ws, cfg, _meta, layout = _prepare(args, need_metadata=True)
+
+    if args.at is not None:
+        if not 0 <= args.at < layout.nt:
+            print(
+                f"t={args.at} is outside the timeline 0..{layout.nt - 1}",
+                file=sys.stderr,
+            )
+            return 1
+        file_i, local_t = layout.locate(args.at)
+        print(f"t={args.at}  ->  file {file_i}, timepoint {local_t}")
+        print(f"           {Path(cfg.files[file_i]).name}")
+        alive = layout.tiles_at(args.at)
+        print(f"tiles      {len(alive)}: {', '.join(alive)}")
+        print(f"anchors    {', '.join(layout.anchors_at(args.at)) or '(none)'}")
+        return 0
+
+    name_w = max(len(Path(f).name) for f in cfg.files)
+    span_w = len(f"{layout.nt - 1}") * 2 + 2
+    print(
+        f"{'file':>4}  {'timepoints':>{span_w}}  {'n':>5}  "
+        f"{'tiles':>5}  {'anchors':<18}  {'name':<{name_w}}"
+    )
+    for i in range(cfg.n_files):
+        start = layout.file_start[i]
+        n = layout.nts[i]
+        anchors = (
+            layout.references_for_file(i)
+            if hasattr(layout, "references_for_file")
+            else cfg.references_for_file(i)
+        )
+        alive = len(layout.tiles_at(start))
+        print(
+            f"{i:>4}  {f'{start}..{start + n - 1}':>{span_w}}  {n:>5}  "
+            f"{alive:>5}  {', '.join(anchors) or '-':<18}  "
+            f"{Path(cfg.files[i]).name:<{name_w}}"
+        )
+    print(f"{'':>4}  {'':>{span_w}}  {layout.nt:>5}  total")
+    return 0
+
+
 def cmd_status(args) -> int:
     ws, cfg, meta, layout = _prepare(args, need_metadata=True)
     plan = _plan_for(args, layout, meta)
@@ -162,8 +204,11 @@ def cmd_offsets(args) -> int:
         nx=layout.nx,
         threads=args.read_threads,
     ) as reader:
+        # Count only the tasks that will actually run: counting the whole plan
+        # on a resumed run leaves every spectrum's use count above zero, so the
+        # cache never releases anything.
         cache = SpectrumCache(
-            reader, plan.spectrum_uses(), workers=args.workers, max_bytes=max_bytes
+            reader, plan.spectrum_uses(todo), workers=args.workers, max_bytes=max_bytes
         )
         n = run_plan(
             plan,
@@ -197,16 +242,16 @@ def cmd_blend(args) -> int:
     plan = build_plan(layout, meta, precision=args.precision)
     store = OffsetStore(ws.offsets)
 
-    try:
-        coords = build_coordinates(layout, plan, store)
-    except MissingOffsets as e:
-        print(str(e), file=sys.stderr)
-        return 1
-
     output = Path(args.output).expanduser() if args.output else ws.canvas
     tile_shape = (layout.nz, layout.ny, layout.nx)
     t0 = 0 if args.between is None else args.between[0]
     t1 = layout.nt if args.between is None else args.between[1]
+
+    try:
+        coords = build_coordinates(layout, plan, store, t0, t1)
+    except MissingOffsets as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
     if args.recreate and output.exists():
         import shutil
@@ -225,6 +270,7 @@ def cmd_blend(args) -> int:
             t0,
             t1,
             recreate=args.recreate,
+            pad=args.pad[0] if len(args.pad) == 1 else args.pad,
         )
     except CanvasMismatch as e:
         print(str(e), file=sys.stderr)
@@ -243,9 +289,11 @@ def cmd_blend(args) -> int:
         f"origin={geometry.origin}  dtype={geometry.dtype}"
         f"{'  (new)' if is_new else '  (existing frame)'}"
     )
-    slack = geometry.slack(coords, tile_shape, layout.nt)
+    slack = geometry.slack(coords, tile_shape, layout.nt, t0, t1)
     if any(v > 0 for v in slack):
-        need = CanvasGeometry.required(coords, tile_shape, layout.nt, args.dtype)
+        need = CanvasGeometry.required(
+            coords, tile_shape, layout.nt, args.dtype, t0, t1
+        )
         print(
             f"slack      {slack} larger than the current coordinates need "
             f"{need.spatial}; delete the canvas and re-run to shrink it"
@@ -307,6 +355,170 @@ def cmd_blend(args) -> int:
     return 0
 
 
+def cmd_inspect(args) -> int:
+    from .inspect import inspect_pair
+    from .reader import Nd2Reader
+
+    ws, cfg, meta, layout = _prepare(args, need_metadata=True)
+    plan = build_plan(layout, meta, precision=args.precision)
+    store = OffsetStore(ws.offsets)
+
+    tasks = [t for t in plan.pair_tasks if t.t == args.at]
+    if args.pair:
+        want = tuple(args.pair.split(","))
+        tasks = [t for t in tasks if (t.a, t.b) == want or (t.b, t.a) == want]
+        if not tasks:
+            names = sorted(
+                {n for t in plan.pair_tasks if t.t == args.at for n in (t.a, t.b)}
+            )
+            print(
+                f"no pair {want} at t={args.at}; tiles here: {names}", file=sys.stderr
+            )
+            return 1
+    if not tasks:
+        print(f"no neighbour pairs at t={args.at}", file=sys.stderr)
+        return 1
+
+    missing = [t for t in tasks if store.get(t.key) is None]
+    if missing:
+        print(
+            f"{len(missing)} pair offset(s) at t={args.at} not computed; "
+            f"run `stitch offsets --between {args.at} {args.at + 1}`",
+            file=sys.stderr,
+        )
+        return 1
+
+    root = Path(args.out) if args.out else ws.root / "inspect"
+    written = []
+    with Nd2Reader(
+        cfg.files,
+        file_keys(meta),
+        nz=layout.nz,
+        ny=layout.ny,
+        nx=layout.nx,
+        threads=args.read_threads,
+    ) as reader:
+        for task in tasks:
+            offset = store.get(task.key)
+            out = root / f"t{task.t}" / f"{task.a}__{task.b}"
+            inspect_pair(task, offset, reader, out, response=not args.no_response)
+            nominal = [0, 0, 0]
+            nominal[task.axis] = task.shift_px
+            delta = [
+                int(a - b) for a, b in zip((offset.dz, offset.dy, offset.dx), nominal)
+            ]
+            print(
+                f"{task.a} | {task.b}  axis={task.axis}  "
+                f"offset=({offset.dz}, {offset.dy}, {offset.dx})  "
+                f"vs nominal {tuple(nominal)}  delta={tuple(delta)}"
+            )
+            written.append(out)
+
+    print(f"\nwrote {len(written)} pair(s) under {root}")
+    print("napari " + " ".join(str(w / "measured.zarr") for w in written[:3]))
+    return 0
+
+
+def cmd_drift(args) -> int:
+    import numpy as np
+
+    from .inspect import inspect_drift
+    from .reader import Nd2Reader
+
+    ws, cfg, meta, layout = _prepare(args, need_metadata=True)
+    plan = build_plan(layout, meta, precision=args.precision)
+    store = OffsetStore(ws.offsets)
+
+    tasks = sorted(
+        (t for t in plan.time_tasks if t.name == args.tile), key=lambda t: t.t_to
+    )
+    if not tasks:
+        anchors = sorted({t.name for t in plan.time_tasks})
+        print(
+            f"'{args.tile}' has no drift steps; anchors are {anchors}", file=sys.stderr
+        )
+        return 1
+    if args.between:
+        t0, t1 = args.between
+        tasks = [t for t in tasks if t0 <= t.t_to < t1]
+        if not tasks:
+            print(
+                f"no drift steps for '{args.tile}' in t={t0}..{t1 - 1}", file=sys.stderr
+            )
+            return 1
+
+    pending = [t for t in tasks if store.get(t.key) is None]
+    if pending:
+        print(
+            f"{len(pending)} drift offset(s) not computed; "
+            f"run `stitch offsets --between {tasks[0].t_to} {tasks[-1].t_to + 1}`",
+            file=sys.stderr,
+        )
+        return 1
+
+    # flag the steps worth looking at before writing anything
+    mags = []
+    for t in tasks:
+        o = store.get(t.key)
+        mags.append(
+            (t.t_to, float(np.linalg.norm([o.dz, o.dy, o.dx])), (o.dz, o.dy, o.dx))
+        )
+    typical = float(np.median([m for _, m, _ in mags])) if mags else 0.0
+    outliers = [m for m in mags if m[1] > max(3 * typical, typical + 5)]
+
+    print(f"tile       {args.tile}")
+    print(f"steps      {len(tasks)}  (t={tasks[0].t_to}..{tasks[-1].t_to})")
+    print(f"median     {typical:.1f} px per step")
+    if outliers:
+        print(f"outliers   {len(outliers)}:")
+        for t, mag, off in outliers[:10]:
+            print(f"  t={t:<6} {mag:7.1f} px  (dz,dy,dx)={off}")
+        if len(outliers) > 10:
+            print(f"  ... and {len(outliers) - 10} more")
+    else:
+        print("outliers   none stand out from the median")
+
+    out = Path(args.out) if args.out else ws.root / "drift" / args.tile
+    progress = None
+    if not args.no_progress:
+        try:
+            from tqdm import tqdm
+
+            progress = lambda xs: tqdm(xs, unit="t")
+        except ImportError:
+            pass
+
+    with Nd2Reader(
+        cfg.files,
+        file_keys(meta),
+        nz=layout.nz,
+        ny=layout.ny,
+        nx=layout.nx,
+        threads=args.read_threads,
+        max_open_files=args.open_files,
+    ) as reader:
+        inspect_drift(
+            args.tile,
+            tasks,
+            store,
+            reader,
+            out,
+            size=None if args.size <= 0 else args.size,
+            response=not args.no_response,
+            full=args.full,
+            progress=progress,
+        )
+
+    print(f"\nwrote {out}")
+    print(
+        f"napari {out}/aligned_xy.zarr {out}/response.zarr"
+        if not args.full
+        else f"napari {out}/aligned.zarr"
+    )
+    print(f"offsets table: {out}/offsets.csv")
+    return 0
+
+
 def _volume_ref(layout, meta, name: str, t: int):
     from .offsets import VolumeRef
 
@@ -326,7 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--precision",
             choices=("float32", "float64"),
-            default="float64",
+            default="float32",
             help="float32 is ~2x faster and halves memory; it is part "
             "of the cache key, so switching recomputes",
         )
@@ -339,6 +551,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="read ND2 headers and check the neighbour graph",
     )
     v.set_defaults(func=cmd_validate)
+
+    tl = common(
+        sub.add_parser("timeline", help="which global timepoints live in which file")
+    )
+    tl.add_argument("--at", type=int, help="look up one global timepoint")
+    tl.set_defaults(func=cmd_timeline)
 
     s = common(sub.add_parser("status", help="what is done and what is left"))
     s.add_argument("--between", type=int, nargs=2, metavar=("T0", "T1"))
@@ -356,6 +574,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     o.add_argument("--workers", type=int, default=-1, help="threads per FFT")
     o.add_argument("--read-threads", type=int, default=10)
+    o.add_argument(
+        "--open-files", type=int, default=2, help="ND2 files kept open at once"
+    )
     o.add_argument("--max-mb", type=int, help="cap on the spectrum cache")
     o.add_argument("--dry-run", action="store_true")
     o.add_argument("--no-progress", action="store_true")
@@ -370,6 +591,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     b.add_argument("--between", type=int, nargs=2, metavar=("T0", "T1"))
     b.add_argument("--dtype", default="uint16")
+    b.add_argument(
+        "--pad",
+        type=int,
+        nargs="+",
+        default=[0],
+        metavar="N",
+        help="extra pixels on every side; one value pads y and x, "
+        "three pad z y x. Use when blending a prefix: the frame "
+        "is fixed once created and later timepoints usually "
+        "drift outside a tight one",
+    )
     b.add_argument(
         "--recreate",
         action="store_true",
@@ -392,9 +624,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not record progress (every run rewrites everything)",
     )
     b.add_argument("--read-threads", type=int, default=10)
+    b.add_argument(
+        "--open-files", type=int, default=2, help="ND2 files kept open at once"
+    )
     b.add_argument("--dry-run", action="store_true")
     b.add_argument("--no-progress", action="store_true")
     b.set_defaults(func=cmd_blend)
+
+    i = common(sub.add_parser("inspect", help="export a neighbour pair for napari"))
+    i.add_argument("--at", type=int, required=True, help="timepoint")
+    i.add_argument("--pair", help="'a,b'; default is every pair at that timepoint")
+    i.add_argument("--out", type=Path, help="defaults to <workspace>/inspect")
+    i.add_argument(
+        "--no-response",
+        action="store_true",
+        help="skip the correlation surface (saves one FFT)",
+    )
+    i.add_argument("--read-threads", type=int, default=10)
+    i.set_defaults(func=cmd_inspect)
+
+    dr = common(sub.add_parser("drift", help="export one tile's drift over time"))
+    dr.add_argument("--tile", required=True, help="anchor tile name")
+    dr.add_argument("--between", type=int, nargs=2, metavar=("T0", "T1"))
+    dr.add_argument(
+        "--size",
+        type=int,
+        default=256,
+        help="centred lateral crop; 0 keeps the whole tile",
+    )
+    dr.add_argument(
+        "--full",
+        action="store_true",
+        help="write a full (T, z, y, x) stack instead of projections (large)",
+    )
+    dr.add_argument("--out", type=Path, help="defaults to <workspace>/drift/<tile>")
+    dr.add_argument("--no-response", action="store_true")
+    dr.add_argument("--read-threads", type=int, default=10)
+    dr.add_argument("--open-files", type=int, default=2)
+    dr.add_argument("--no-progress", action="store_true")
+    dr.set_defaults(func=cmd_drift)
     return ap
 
 
