@@ -816,3 +816,99 @@ def test_compose_returns_the_canvas_dtype(scene):
     lay, coords, _refs, _, geom = scene
     img, _boxes, _region = _compose(0, lay, coords, NamedReader(), geom)
     assert img.dtype == np.dtype(geom.dtype)
+
+
+# --- 2D counts planes ---------------------------------------------------------
+def test_z_segments_splits_where_coverage_changes():
+    from multi_nd2_stitching.blend import z_segments
+
+    boxes = {"a": ((0, 0, 0), (4, 8, 8)), "b": ((2, 0, 0), (6, 8, 8))}
+    segs = z_segments(boxes, 8)
+    assert [(za, zb, sorted(c)) for za, zb, c in segs] == [
+        (0, 2, ["a"]),
+        (2, 4, ["a", "b"]),
+        (4, 6, ["b"]),
+        (6, 8, []),
+    ]
+
+
+def test_z_segments_with_one_tile_is_a_single_span():
+    from multi_nd2_stitching.blend import z_segments
+
+    assert z_segments({"a": ((0, 0, 0), (4, 8, 8))}, 4) == [(0, 4, ["a"])]
+
+
+def test_z_offsets_do_not_break_normalisation(scene):
+    """Tiles at different z cover different z-planes, so each plane needs its
+    own counts. tile_b is lifted by 1, so the three planes see three different
+    tile sets."""
+    lay, coords, _refs, _, _geom = scene
+    shifted = type(coords)(
+        tuple(
+            {n: (c + np.array([1, 0, 0]) if n == "tile_b" else c) for n, c in f.items()}
+            for f in coords.by_time
+        ),
+        window=coords.window,  # extent() reads the window; the default is empty
+    )
+    geom = CanvasGeometry.required(shifted, (lay.nz, lay.ny, lay.nx), lay.nt, "uint16")
+    img, _boxes, _region = _compose(0, lay, shifted, NamedReader(), geom)
+    assert img.shape[0] == lay.nz + 1, "the lift makes the canvas one z deeper"
+
+    row = lambda z: img[z, 0, :]
+    # z=0: only tile_a (100) reaches here; tile_b starts at z=1
+    assert row(0)[0] == 0 and row(0)[-1] == 100
+    # z=1: both tiles, so the overlap is a gradient between them
+    assert row(1)[0] == 200 and row(1)[-1] == 100
+    assert 100 < row(1)[6] < 200
+    # z=2: only tile_b (200); tile_a has ended
+    assert row(2)[0] == 200 and row(2)[-1] == 0
+
+
+def test_composed_values_match_a_reference_implementation(scene):
+    """The 2D-plane normalise must equal the obvious 3D one, voxel for voxel."""
+    lay, coords, _refs, _, geom = scene
+    reader = NamedReader()
+    boxes = tile_boxes(0, lay, coords, geom)
+    region = snap_to_chunks(boxes_bbox(boxes), (1, 1, 1), geom.spatial)
+    volumes = load_timepoint(reader, {(0, n): n for n in boxes}, 0, list(boxes))
+    got = compose_timepoint(0, lay, coords, volumes, geom, region, boxes)
+
+    # reference: accumulate a full 3D counts array, divide, then convert
+    shape = tuple(int(r[1] - r[0]) for r in region)
+    origin = np.array([r[0] for r in region])
+    accum = np.zeros(shape, np.float32)
+    counts = np.zeros(shape, np.float32)
+    for name, frame in volumes.items():
+        z0, y0, x0 = np.array(boxes[name][0]) - origin
+        sls = (
+            slice(z0, z0 + lay.nz),
+            slice(y0, y0 + lay.ny),
+            slice(x0, x0 + lay.nx),
+        )
+        w = blend_weights(name, 0, coords, lay.pairs_at(0), (lay.nz, lay.ny, lay.nx))
+        accum[sls] += frame * w
+        counts[sls] += w
+    np.maximum(counts, 1e-12, out=counts)
+    want = (accum / counts).astype(np.uint16)
+    assert np.array_equal(got, want)
+
+
+def test_the_divisor_floor_perturbs_nothing(scene):
+    """The plane is seeded with EPS instead of being zeroed and clamped, which
+    is only safe if EPS is below the float32 ulp of every real weight."""
+    from multi_nd2_stitching.blend import EPS
+
+    for w in (0.01, 0.5, 0.99, 3.96):
+        assert np.float32(w) + np.float32(EPS) == np.float32(w)
+    assert EPS < np.spacing(np.float32(0.01))
+
+
+def test_a_fully_uncovered_plane_gives_zeros(scene):
+    """A z-segment no tile spans: every divisor is EPS, every accum is 0."""
+    lay, coords, _refs, _, _geom = scene
+    tall = CanvasGeometry(
+        origin=(0, 0, -5), shape=(lay.nt, lay.nz + 3, lay.ny, 13), dtype="uint16"
+    )
+    img, _boxes, _region = _compose(0, lay, coords, NamedReader(), tall)
+    assert not np.isnan(img.astype(np.float32)).any()
+    assert np.all(img[lay.nz :] == 0), "planes past every tile must be zero"

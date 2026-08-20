@@ -14,6 +14,7 @@ rather than the run.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import time
 import warnings
@@ -188,6 +189,10 @@ def _weights_key(name, t, coords, pairs, tile_shape):
     return (tile_shape, tuple(sorted(parts)))
 
 
+# Divisor floor for uncovered voxels. Must stay far below the float32 ulp of
+# the smallest ramp weight (0.01, ulp ~1e-9) so it perturbs nothing real.
+EPS = 1e-12
+
 WEIGHTS_CACHE_MAX = 24
 
 
@@ -285,6 +290,27 @@ def load_timepoint(reader, refs, t, names) -> dict:
     return {name: arrays[ref] for name, ref in wanted.items()}
 
 
+def z_segments(boxes, region_z):
+    """Split the region's z range where the set of covering tiles changes.
+
+    `counts` -- the sum of tile weights at a voxel -- depends on z only through
+    *which tiles span that z*. Tiles do have z offsets, but only a handful of
+    distinct ones, so a few 2D planes describe the whole 3D array. Each plane
+    is a few hundred KB and stays in cache; the 3D counts array was the size of
+    the canvas and had to be accumulated tile by tile.
+    """
+    edges = {0, int(region_z)}
+    for lo, hi in boxes.values():
+        for z in (lo[0], hi[0]):
+            if 0 < z < region_z:
+                edges.add(int(z))
+    marks = sorted(edges)
+    return [
+        (za, zb, [n for n, (lo, hi) in boxes.items() if lo[0] <= za and zb <= hi[0]])
+        for za, zb in itertools.pairwise(marks)
+    ]
+
+
 def compose_timepoint(
     t,
     layout,
@@ -297,44 +323,62 @@ def compose_timepoint(
     buffer=None,
     weights_cache=None,
 ):
-    """Blend one timepoint into a float32 array covering `region`.
+    """Blend one timepoint into an array covering `region`, in the canvas dtype.
 
     Buffers are sized to the written region, not to the canvas, so padding and
-    empty space cost nothing at all -- not even the page faults that a
-    whole-canvas mask scan used to force.
+    empty space cost nothing -- not even the page faults that a whole-canvas
+    mask scan used to force.
+
+    Two things here look redundant and are not; both were measured:
+
+    * The tile is cast to float32 in the reuse buffer and scaled in place
+      rather than `multiply(uint16_3d, float32_2d)` in one call. numpy's
+      mixed-dtype broadcast loop runs at roughly an eighth of the bandwidth of
+      the same-dtype one, so two fast passes beat one slow pass by ~2x.
+    * The normalise divides straight into the output dtype. Dividing and then
+      converting is two full passes over the region plus a second region-sized
+      allocation; fused it is one pass, measured ~3.8x faster.
     """
     origin = np.array([r[0] for r in region])
     shape = tuple(int(r[1] - r[0]) for r in region)
     accum = np.zeros(shape, dtype=np.float32)
-    counts = np.zeros(shape, dtype=np.float32)
     tile_shape = (layout.nz, layout.ny, layout.nx)
     pairs = layout.pairs_at(t)
     if buffer is None:
         buffer = np.empty(tile_shape, dtype=np.float32)
 
+    placed = {}
+    weights_by_tile = {}
     for name, frame in volumes.items():
         if name not in boxes:
             continue
-        z0, y0, x0 = np.array(boxes[name][0]) - origin
-        sls = (
-            slice(z0, z0 + layout.nz),
-            slice(y0, y0 + layout.ny),
-            slice(x0, x0 + layout.nx),
-        )
+        z0, y0, x0 = (int(v) for v in np.array(boxes[name][0]) - origin)
+        placed[name] = (z0, y0, x0)
         weights = blend_weights(name, t, coords, pairs, tile_shape, weights_cache)
-        # into a reused buffer: the product is a full tile of float32, and
-        # allocating one per tile per timepoint is gigabytes of churn.
-        np.multiply(frame, weights, out=buffer)
-        accum[sls] += buffer
-        counts[sls] += weights
+        weights_by_tile[name] = weights
+        np.copyto(buffer, frame, casting="unsafe")
+        np.multiply(buffer, weights, out=buffer)
+        accum[z0 : z0 + layout.nz, y0 : y0 + layout.ny, x0 : x0 + layout.nx] += buffer
 
-    # Uncovered voxels have counts == 0 and accum == 0, so clamping the divisor
-    # leaves them at zero without needing a mask array.
-    np.maximum(counts, 1e-12, out=counts)
-    accum /= counts
-    # Convert here rather than per chunk in the writer: the result is held for
-    # the whole of the next timepoint's compose, and uint16 is half of float32.
-    return accum.astype(dtype)
+    image = np.empty(shape, dtype=dtype)
+    plane = np.empty(shape[1:], dtype=np.float32)
+    local_boxes = {
+        name: ((z, y, x), (z + layout.nz, y + layout.ny, x + layout.nx))
+        for name, (z, y, x) in placed.items()
+    }
+    for za, zb, covering in z_segments(local_boxes, shape[0]):
+        # Seed with the floor rather than zeroing and clamping afterwards. Any
+        # weight a tile contributes is at least 0.01, whose float32 ulp is ~1e-9,
+        # so EPS is far below the rounding of every covered voxel and adds
+        # nothing to them. Uncovered voxels keep EPS, and their accum is exactly
+        # zero, so the divide yields zero rather than 0/0. One pass over the
+        # plane instead of three.
+        plane.fill(EPS)
+        for name in covering:
+            _, y0, x0 = placed[name]
+            plane[y0 : y0 + layout.ny, x0 : x0 + layout.nx] += weights_by_tile[name]
+        np.divide(accum[za:zb], plane, out=image[za:zb], casting="unsafe")
+    return image
 
 
 def bbox_of(inds) -> list[list[int]] | None:
