@@ -391,7 +391,7 @@ def cmd_blend(args) -> int:
         try:
             from tqdm import tqdm
 
-            progress = lambda xs: tqdm(xs, unit="t")
+            progress = lambda total: tqdm(total=total, unit="tile")
         except ImportError:
             pass
 

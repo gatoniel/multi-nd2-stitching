@@ -611,6 +611,10 @@ def blend(
     The region grows with the mosaic, so a run whose object spreads over time
     uses more memory late than early -- that is the working set, not a leak.
     It is bounded by the canvas. `pipeline=False` removes roughly half of it.
+
+    `progress` is a factory taking the total number of tiles and returning an
+    object with `update(n)` and `close()` -- a tqdm, in practice. Note this is
+    a different contract from run_plan's, which wraps an iterable.
     """
     import zarr
 
@@ -632,8 +636,6 @@ def blend(
     ]
     if not todo:
         return 0
-    it = progress(todo) if progress is not None else todo
-
     spatial = geometry.spatial
     chunk_zyx = chunk[1:]
     tile_shape = (layout.nz, layout.ny, layout.nx)
@@ -650,6 +652,13 @@ def blend(
             union_bbox(boxes_bbox(boxes), stale), chunk_zyx, spatial
         )
         plans[t] = (boxes, stale, region)
+
+    # Advance the bar by tiles, not timepoints. Early timepoints hold one or
+    # two tiles and late ones the whole mosaic, so a per-timepoint bar
+    # under-predicts at the start and over-predicts at the end. Every tile
+    # count is known from `plans` before any work happens.
+    total_tiles = sum(len(plans[t][0]) for t in todo)
+    bar = progress(total_tiles) if progress is not None else None
 
     def load(t):
         clock = time.perf_counter()
@@ -700,7 +709,7 @@ def blend(
         pending = None
 
         # `it` is iterated lazily so a tqdm bar advances as work completes
-        for i, t in enumerate(it):
+        for i, t in enumerate(todo):
             volumes = ahead.result() if ahead is not None else load(t)
             if loader is not None and i + 1 < len(todo):
                 ahead = loader.submit(load, todo[i + 1])
@@ -738,9 +747,13 @@ def blend(
                 store(t, image)
                 pending = None
             written += 1
+            if bar is not None:
+                bar.update(len(plans[t][0]))
 
         if pending is not None:
             pending.result()
 
+    if bar is not None:
+        bar.close()
     timings.total = time.perf_counter() - started
     return written

@@ -912,3 +912,81 @@ def test_a_fully_uncovered_plane_gives_zeros(scene):
     img, _boxes, _region = _compose(0, lay, coords, NamedReader(), tall)
     assert not np.isnan(img.astype(np.float32)).any()
     assert np.all(img[lay.nz :] == 0), "planes past every tile must be zero"
+
+
+# --- progress -----------------------------------------------------------------
+class TileBar:
+    """A tqdm-shaped stand-in that records how it was driven."""
+
+    def __init__(self, total):
+        self.total = total
+        self.n = 0
+        self.closed = False
+
+    def update(self, n):
+        self.n += n
+
+    def close(self):
+        self.closed = True
+
+
+def test_progress_counts_tiles_not_timepoints(scene, tmp_path):
+    """Timepoints differ in tile count, so tiles are the honest unit."""
+    lay, coords, refs, _, geom = scene
+    bars = []
+
+    def factory(total):
+        bars.append(TileBar(total))
+        return bars[-1]
+
+    blend(
+        lay,
+        coords,
+        FlatReader(),
+        refs,
+        tmp_path / "c.zarr",
+        BlendLog(None),
+        geom,
+        progress=factory,
+    )
+    expected = sum(len(lay.tiles_at(t)) for t in range(lay.nt))
+    assert bars[0].total == expected
+    assert bars[0].n == expected
+    assert expected != lay.nt, "this scene must have >1 tile per timepoint"
+
+
+def test_progress_total_reflects_uneven_timepoints(scene, tmp_path):
+    """Drop a tile at one timepoint: the total must fall by exactly one."""
+    lay, coords, refs, _, geom = scene
+    thin = coords.restrict(
+        {t: ("tile_a",) if t == 0 else tuple(lay.tiles_at(t)) for t in range(lay.nt)}
+    )
+    bars = []
+    blend(
+        lay,
+        thin,
+        FlatReader(),
+        refs,
+        tmp_path / "c.zarr",
+        BlendLog(None),
+        geom,
+        progress=lambda total: bars.append(TileBar(total)) or bars[-1],
+    )
+    full = sum(len(lay.tiles_at(t)) for t in range(lay.nt))
+    assert bars[0].total == full - 1
+
+
+def test_progress_bar_is_closed(scene, tmp_path):
+    lay, coords, refs, _, geom = scene
+    bars = []
+    blend(
+        lay,
+        coords,
+        FlatReader(),
+        refs,
+        tmp_path / "c.zarr",
+        BlendLog(None),
+        geom,
+        progress=lambda total: bars.append(TileBar(total)) or bars[-1],
+    )
+    assert bars[0].closed
