@@ -166,12 +166,20 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
         for f in cfg.positions[name].reference_in_files:
             is_anchor[file_start[f] : file_start[f] + nts[f], i] = True
 
-    # overrides, applied in this order: drops first, then anchors
+    # Overrides in three passes, so the result does not depend on the order the
+    # blocks happen to be written in: everything is dropped, then unanchored,
+    # then anchored. A tile listed in both unanchor and anchor is contradictory
+    # and is caught by validate, not silently resolved here.
     for o in cfg.overrides:
         for t in o.at:
             for name in o.drop:
                 tile_alive[t, tiles.index(name)] = False
+    for o in cfg.overrides:
+        for t in o.at:
+            for name in o.unanchor:
                 is_anchor[t, tiles.index(name)] = False
+    for o in cfg.overrides:
+        for t in o.at:
             for name in o.anchor:
                 is_anchor[t, tiles.index(name)] = True
     is_anchor &= tile_alive

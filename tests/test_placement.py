@@ -214,3 +214,37 @@ def test_placement_matches_the_coordinates_that_get_built(scene):
     coords = build_coordinates(lay, plan, store)
     for t in range(lay.nt):
         assert set(coords.at(t)) == {s.tile for s in plan_placement(lay, t).steps}
+
+
+# --- handover between anchors -------------------------------------------------
+def test_two_anchors_at_a_handover_are_ambiguous_without_unanchor(scene):
+    lay = scene(
+        {"a": {"start": [0, 0], **ANCHOR}, "b": {"start": [0, 0]}},
+        {"a": (0.0, 0.0), "b": (55.0, 0.0)},
+        overrides=[{"at": 1, "anchor": ["b"]}],
+    )
+    assert plan_placement(lay, 1).ambiguous
+
+
+def test_unanchor_resolves_the_handover(scene):
+    lay = scene(
+        {"a": {"start": [0, 0], **ANCHOR}, "b": {"start": [0, 0]}},
+        {"a": (0.0, 0.0), "b": (55.0, 0.0)},
+        overrides=[{"at": 1, "unanchor": ["a"], "anchor": ["b"]}],
+    )
+    p = plan_placement(lay, 1)
+    assert not p.ambiguous
+    assert [s.tile for s in p.seeds] == ["b"]
+    assert p.by_tile["a"].via == "b", "a is now placed off its neighbour"
+
+
+def test_the_handover_is_a_single_timepoint(scene):
+    """b anchors only at t=1; a takes the drift back afterwards."""
+    lay = scene(
+        {"a": {"start": [0, 0], **ANCHOR}, "b": {"start": [0, 0]}},
+        {"a": (0.0, 0.0), "b": (55.0, 0.0)},
+        overrides=[{"at": 1, "unanchor": ["a"], "anchor": ["b"]}],
+    )
+    assert [s.tile for s in plan_placement(lay, 1).seeds] == ["b"]
+    assert [s.tile for s in plan_placement(lay, 2).seeds] == ["a"]
+    assert plan_placement(lay, 2).by_tile["b"].via == "a"

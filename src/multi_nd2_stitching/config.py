@@ -72,17 +72,33 @@ class Override:
     Groups the edits that belong together. Dropping a tile can disconnect the
     neighbour graph, which then needs a fresh anchor at the same timepoint --
     those two edits are one decision and live in one block.
+
+    The four verbs:
+      drop      the tile is not there at all: no coordinate, no neighbour edges
+      unanchor  the tile stays and is still placed, but not by drifting from
+                t-1 -- it hangs off a neighbour instead
+      anchor    the tile is placed by drifting from t-1, in addition to
+                whatever reference_in_files says
+      realign   recompute this tile's drift step using realignment_slices
+
+    `unanchor` is what you want when a tile should keep its place in the mosaic
+    while some *other* tile carries the drift across a timepoint. Two anchors in
+    one connected component over-determine it, so handing over means unanchoring
+    one as you anchor the other.
     """
 
     at: Timepoints
     reason: str | None = None
     drop: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
+    unanchor: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
     anchor: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
     realign: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
 
     @property
     def names(self) -> set[str]:
-        return set(self.drop) | set(self.anchor) | set(self.realign)
+        return (
+            set(self.drop) | set(self.unanchor) | set(self.anchor) | set(self.realign)
+        )
 
 
 @attrs.define(kw_only=True)
@@ -109,6 +125,9 @@ class StitchingConfig:
 
     def dropped_at(self, t: int) -> set[str]:
         return {n for o in self.overrides if t in o.at for n in o.drop}
+
+    def unanchored_at(self, t: int) -> set[str]:
+        return {n for o in self.overrides if t in o.at for n in o.unanchor}
 
     def anchored_at(self, t: int) -> set[str]:
         return {n for o in self.overrides if t in o.at for n in o.anchor}

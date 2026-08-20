@@ -1,7 +1,6 @@
 import pytest
-from helpers import build
 
-from multi_nd2_stitching.validate import ConfigError, check, check_layout, validate
+from multi_nd2_stitching.validate import ConfigError, check, validate
 
 
 def test_minimal_is_valid(cfg_dict, parse):
@@ -79,7 +78,7 @@ def test_detects_problem(cfg_dict, parse, mutate, fragment):
         ({"at": 5, "drop": ["tile_b"], "anchor": ["tile_b"]}, "same block"),
         ({"at": 0, "realign": ["tile_a"]}, "no predecessor"),
         # the coupling this schema exists to surface
-        ({"at": 143, "drop": ["tile_a"]}, "without naming a replacement anchor"),
+        ({"at": 143, "drop": ["tile_a"]}, "without naming a replacement"),
     ],
 )
 def test_detects_override_problem(cfg_dict, parse, override, fragment):
@@ -144,49 +143,39 @@ def test_check_files_reports_missing_paths(cfg_dict, parse):
     assert sum("does not exist" in p for p in problems) == 2
 
 
-# --- connectivity -------------------------------------------------------------
-def test_clean_config_is_connected(cfg_dict):
-    assert check_layout(build(cfg_dict)) == []
+# --- unanchor -----------------------------------------------------------------
+@pytest.mark.parametrize(
+    "override,fragment",
+    [
+        (
+            {"at": 5, "unanchor": ["tile_a"], "anchor": ["tile_a"]},
+            "both unanchored and anchored",
+        ),
+        (
+            {"at": 5, "unanchor": ["tile_a"], "drop": ["tile_a"]},
+            "unanchor does nothing",
+        ),
+        ({"at": 5, "unanchor": ["nope"]}, "unknown position"),
+        (
+            {"at": 5, "unanchor": ["tile_a"]},
+            "without naming a replacement",
+        ),
+    ],
+)
+def test_detects_unanchor_problem(cfg_dict, parse, override, fragment):
+    cfg_dict["overrides"] = [override]
+    problems = check(parse(cfg_dict))
+    assert any(fragment in p for p in problems), problems
 
 
-def test_detects_component_without_anchor(cfg_dict):
-    cfg_dict["positions"] = {
-        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
-        "a1": {"start": [0, 0]},
-        "a2": {"start": [0, 0]},
-    }
-    cfg_dict["overrides"] = [{"at": 7, "drop": ["a1"]}]
-    problems = check_layout(build(cfg_dict, tiles=("a", "a1", "a2")))
-    assert any("no anchor at t=7" in p for p in problems), problems
-
-
-def test_replacement_anchor_fixes_it(cfg_dict):
-    cfg_dict["positions"] = {
-        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
-        "a1": {"start": [0, 0]},
-        "a2": {"start": [0, 0]},
-    }
-    cfg_dict["overrides"] = [{"at": 7, "drop": ["a1"], "anchor": ["a2"]}]
-    assert check_layout(build(cfg_dict, tiles=("a", "a1", "a2"))) == []
-
-
-def test_detects_anchor_with_no_predecessor(cfg_dict):
-    cfg_dict["positions"] = {
-        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
-        "a1": {"start": [0, 0]},
-        "a2": {"start": [1, 2]},
-    }
-    cfg_dict["overrides"] = [{"at": 7, "drop": ["a1"], "anchor": ["a2"]}]
-    problems = check_layout(build(cfg_dict, tiles=("a", "a1", "a2")))
-    assert any("no coordinate to drift from" in p for p in problems), problems
-
-
-def test_ranges_are_collapsed_in_messages(cfg_dict):
-    cfg_dict["positions"] = {
-        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
-        "a1": {"start": [0, 0]},
-        "a2": {"start": [0, 0]},
-    }
-    cfg_dict["overrides"] = [{"at": [3, 4, 5, 8], "drop": ["a1"]}]
-    problems = check_layout(build(cfg_dict, tiles=("a", "a1", "a2")))
-    assert any("t=3-5, 8" in p for p in problems), problems
+def test_a_clean_handover_passes(cfg_dict, parse):
+    cfg_dict["positions"]["tile_b"]["reference_in_files"] = [0, 1]
+    cfg_dict["overrides"] = [
+        {
+            "at": 5,
+            "reason": "tile_b carries the drift across the file boundary",
+            "unanchor": ["tile_a"],
+            "anchor": ["tile_b"],
+        }
+    ]
+    assert check(parse(cfg_dict)) == []

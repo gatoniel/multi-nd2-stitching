@@ -5,6 +5,7 @@ from helpers import build, make_meta
 
 from multi_nd2_stitching.config import loads_config
 from multi_nd2_stitching.layout import build_layout
+from multi_nd2_stitching.validate import check_layout
 
 
 # --- timeline -----------------------------------------------------------------
@@ -36,7 +37,7 @@ def test_ragged_files(cfg_dict):
             m.__class__(
                 **{**{f.name: getattr(m, f.name) for f in m.__attrs_attrs__}, "nt": n}
             )
-            for m, n in zip(meta.files, [3, 7, 2])
+            for m, n in zip(meta.files, [3, 7, 2], strict=False)
         )
     )
     lay = build_layout(
@@ -156,6 +157,54 @@ def test_a_dropped_tile_is_never_an_anchor(cfg_dict):
     assert lay.anchors_at(3) == ["tile_b"]
 
 
+# --- connectivity -------------------------------------------------------------
+def test_clean_config_is_connected(cfg_dict):
+    assert check_layout(build(cfg_dict)) == []
+
+
+def test_detects_component_without_anchor(cfg_dict):
+    cfg_dict["positions"] = {
+        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
+        "a1": {"start": [0, 0]},
+        "a2": {"start": [0, 0]},
+    }
+    cfg_dict["overrides"] = [{"at": 7, "drop": ["a1"]}]
+    problems = check_layout(build(cfg_dict, tiles=("a", "a1", "a2")))
+    assert any("no anchor at t=7" in p for p in problems), problems
+
+
+def test_replacement_anchor_fixes_it(cfg_dict):
+    cfg_dict["positions"] = {
+        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
+        "a1": {"start": [0, 0]},
+        "a2": {"start": [0, 0]},
+    }
+    cfg_dict["overrides"] = [{"at": 7, "drop": ["a1"], "anchor": ["a2"]}]
+    assert check_layout(build(cfg_dict, tiles=("a", "a1", "a2"))) == []
+
+
+def test_detects_anchor_with_no_predecessor(cfg_dict):
+    cfg_dict["positions"] = {
+        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
+        "a1": {"start": [0, 0]},
+        "a2": {"start": [1, 2]},
+    }
+    cfg_dict["overrides"] = [{"at": 7, "drop": ["a1"], "anchor": ["a2"]}]
+    problems = check_layout(build(cfg_dict, tiles=("a", "a1", "a2")))
+    assert any("no coordinate to drift from" in p for p in problems), problems
+
+
+def test_ranges_are_collapsed_in_messages(cfg_dict):
+    cfg_dict["positions"] = {
+        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
+        "a1": {"start": [0, 0]},
+        "a2": {"start": [0, 0]},
+    }
+    cfg_dict["overrides"] = [{"at": [3, 4, 5, 8], "drop": ["a1"]}]
+    problems = check_layout(build(cfg_dict, tiles=("a", "a1", "a2")))
+    assert any("t=3-5, 8" in p for p in problems), problems
+
+
 # --- sanity -------------------------------------------------------------------
 def test_layout_is_a_pure_function(cfg_dict):
     """Same inputs -> identical masks. Nothing is carried over between builds."""
@@ -182,3 +231,70 @@ def test_tile_size_mismatch_is_loud(cfg_dict):
     )
     with pytest.raises(ValueError, match="tile size differs"):
         build_layout(loads_config(yaml.safe_dump(cfg_dict)), bad)
+
+
+# --- unanchor -----------------------------------------------------------------
+def test_unanchor_removes_the_anchor_but_keeps_the_tile(cfg_dict):
+    cfg_dict["overrides"] = [{"at": 3, "unanchor": ["tile_a"]}]
+    lay = build(cfg_dict)
+    i = lay.ti("tile_a")
+    assert lay.tile_alive[3, i], "the tile must still be placed"
+    assert not lay.is_anchor[3, i]
+    assert lay.is_anchor[2, i] and lay.is_anchor[4, i]
+
+
+def test_unanchor_keeps_the_pairs_alive(cfg_dict):
+    """Unlike drop: the tile still takes part in the neighbour graph."""
+    cfg_dict["overrides"] = [{"at": 3, "unanchor": ["tile_a"]}]
+    lay = build(cfg_dict)
+    assert len(lay.pairs_at(3)) == 1
+
+
+def test_drop_and_unanchor_differ(cfg_dict):
+    dropped = build({**cfg_dict, "overrides": [{"at": 3, "drop": ["tile_a"]}]})
+    unanchored = build({**cfg_dict, "overrides": [{"at": 3, "unanchor": ["tile_a"]}]})
+    assert "tile_a" not in dropped.tiles_at(3)
+    assert "tile_a" in unanchored.tiles_at(3)
+    assert dropped.anchors_at(3) == unanchored.anchors_at(3) == []
+
+
+def test_handover_leaves_exactly_one_anchor(cfg_dict):
+    """The whole point: unanchor one tile as another takes over."""
+    cfg_dict["positions"]["tile_b"]["reference_in_files"] = [0, 1]
+    cfg_dict["overrides"] = [{"at": 3, "unanchor": ["tile_a"], "anchor": ["tile_b"]}]
+    lay = build(cfg_dict)
+    assert lay.anchors_at(3) == ["tile_b"]
+
+
+def test_unanchor_wins_over_reference_in_files(cfg_dict):
+    cfg_dict["overrides"] = [{"at": 3, "unanchor": ["tile_a"]}]
+    assert build(cfg_dict).anchors_at(3) == []
+
+
+def test_override_order_does_not_matter(cfg_dict):
+    """Blocks are applied in passes, not in the order they are written."""
+    a = build(
+        {
+            **cfg_dict,
+            "overrides": [
+                {"at": 3, "unanchor": ["tile_a"]},
+                {"at": 3, "anchor": ["tile_b"]},
+            ],
+        }
+    )
+    b = build(
+        {
+            **cfg_dict,
+            "overrides": [
+                {"at": 3, "anchor": ["tile_b"]},
+                {"at": 3, "unanchor": ["tile_a"]},
+            ],
+        }
+    )
+    assert a.anchors_at(3) == b.anchors_at(3) == ["tile_b"]
+
+
+def test_a_dropped_tile_is_still_never_an_anchor(cfg_dict):
+    cfg_dict["overrides"] = [{"at": 3, "drop": ["tile_a"], "anchor": ["tile_b"]}]
+    lay = build(cfg_dict)
+    assert lay.anchors_at(3) == ["tile_b"]

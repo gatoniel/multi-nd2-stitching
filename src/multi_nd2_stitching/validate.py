@@ -87,16 +87,27 @@ def _check_overrides(cfg: StitchingConfig, p: list[str]) -> None:
         both = sorted(set(o.drop) & (set(o.anchor) | set(o.realign)))
         if both:
             p.append(f"{where}: {both} dropped and used in the same block")
+        contradictory = sorted(set(o.unanchor) & set(o.anchor))
+        if contradictory:
+            p.append(f"{where}: {contradictory} both unanchored and anchored; pick one")
+        redundant = sorted(set(o.unanchor) & set(o.drop))
+        if redundant:
+            p.append(
+                f"{where}: {redundant} unanchored and dropped; dropping already "
+                "removes the anchor, so the unanchor does nothing"
+            )
         if 0 in o.at and o.realign:
             p.append(f"{where}: realign at t=0, which has no predecessor")
         # The coupling this schema exists to make visible.
         dropped_refs = [
-            n for n in o.drop if n in known and cfg.positions[n].reference_in_files
+            n
+            for n in list(o.drop) + list(o.unanchor)
+            if n in known and cfg.positions[n].reference_in_files
         ]
         if dropped_refs and not o.anchor:
             p.append(
-                f"{where}: drops reference tile(s) {dropped_refs} without naming a "
-                "replacement anchor; the graph may be unanchored at these timepoints"
+                f"{where}: removes the anchor from {dropped_refs} without naming "
+                "a replacement; the graph may be unanchored at these timepoints"
             )
 
 
@@ -111,8 +122,7 @@ def _check_timeline(cfg: StitchingConfig, nts, p: list[str]) -> None:
         f0, t0 = pos.start
         if 0 <= f0 < cfg.n_files and t0 >= nts[f0]:
             p.append(
-                f"positions.{name}.start: timepoint {t0} beyond file {f0} "
-                f"(has {nts[f0]})"
+                f"positions.{name}.start: timepoint {t0} beyond file {f0} (has {nts[f0]})"
             )
 
     for i, o in enumerate(cfg.overrides):
@@ -179,7 +189,7 @@ def _ranges(ts) -> str:
     """[1,2,3,7,9,10] -> '1-3, 7, 9-10'"""
     ts = sorted(ts)
     out, start, prev = [], ts[0], ts[0]
-    for t in ts[1:] + [None]:
+    for t in [*ts[1:], None]:
         if t != prev + 1:
             out.append(str(start) if start == prev else f"{start}-{prev}")
             start = t
