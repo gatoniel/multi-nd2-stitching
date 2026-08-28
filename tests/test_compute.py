@@ -1,11 +1,13 @@
 import numpy as np
 import pytest
+import scipy.fft as spfft
 from helpers import FakeReader
 
 from multi_nd2_stitching.compute import (
     Spectra,
     crop_for_alignment,
     fft_translation_3d,
+    phase_corr_from_ffts,
     run_plan,
     run_task,
 )
@@ -28,6 +30,29 @@ def test_recovers_a_known_translation(shift):
 def test_identical_volumes_give_zero():
     a = vol()
     assert tuple(fft_translation_3d(a, a)) == (0, 0, 0)
+
+
+# --- an exact-zero cross-power bin must not poison the whole correlation ------
+def test_survives_a_zeroed_spectrum_bin(recwarn):
+    """One exactly-zero bin (e.g. a flat/blank patch in the crop) used to turn
+    the *entire* correlation into NaN and silently return (0, 0, 0)."""
+    a = vol()
+    shift = (0, 2, 3)
+    b = np.roll(a, shift, axis=(0, 1, 2))
+    fft0 = spfft.rfftn(a)
+    fft1 = spfft.rfftn(b)
+    fft0[1, 2, 3] = 0  # an otherwise-clean pair with one dead bin
+
+    result = tuple(phase_corr_from_ffts(fft0, fft1, a.shape))
+
+    assert result == tuple(-s for s in shift)
+    assert not [w for w in recwarn.list if issubclass(w.category, RuntimeWarning)]
+
+
+def test_all_zero_volumes_do_not_warn(recwarn):
+    z = np.zeros((4, 8, 8))
+    fft_translation_3d(z, z)
+    assert not [w for w in recwarn.list if issubclass(w.category, RuntimeWarning)]
 
 
 # --- cropping -----------------------------------------------------------------

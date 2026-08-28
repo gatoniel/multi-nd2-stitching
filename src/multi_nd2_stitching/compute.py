@@ -25,7 +25,13 @@ def phase_corr_from_ffts(fft0, fft1, shape, workers: int = -1):
     `(i + n//2) % n - n//2` doesn't.
     """
     mult = fft0 * np.conjugate(fft1)
-    np.divide(mult, np.abs(mult), out=mult)
+    # A cross-power bin is exactly zero only where fft0 or fft1 is exactly
+    # zero -- most often a flat/blank patch in the correlated crop. Dividing
+    # there is 0/0 -> NaN, and one NaN in `mult` turns the whole inverse FFT
+    # (and thus the peak) into garbage. Leave those bins at their already-zero
+    # value instead: "no information here" rather than "poison everything".
+    mag = np.abs(mult)
+    np.divide(mult, mag, out=mult, where=mag != 0)
     inverse = spfft.irfftn(mult, s=shape, workers=workers, axes=list(range(fft0.ndim)))
     peak = np.array(np.unravel_index(np.argmax(inverse), shape=shape))
     half = np.array(shape) // 2
