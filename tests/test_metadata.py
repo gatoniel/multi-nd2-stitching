@@ -143,3 +143,80 @@ def test_position_of_is_loud_on_ambiguity():
     fm = attrs.evolve(make_meta(n_files=1)[0], position_names=("a", "a"))
     with pytest.raises(ValueError, match="match several positions"):
         fm.position_of(("a",))
+
+
+# --- real time ------------------------------------------------------------------
+def test_jdn_to_unix_s_at_the_epoch():
+    assert M._jdn_to_unix_s(2440587.5) == 0.0
+
+
+def test_jdn_to_unix_s_one_day_later():
+    assert M._jdn_to_unix_s(2440588.5) == 86400.0
+
+
+@pytest.mark.parametrize(
+    "loop_indices,expected",
+    [
+        # No T axis at all: every frame counts as t=0.
+        ([{"Z": 0}, {"Z": 1}], {0: 0}),
+        # T outermost (slow), Z innermost (fast): first T=1 is right after Z wraps.
+        (
+            [
+                {"T": 0, "Z": 0},
+                {"T": 0, "Z": 1},
+                {"T": 1, "Z": 0},
+                {"T": 1, "Z": 1},
+            ],
+            {0: 0, 1: 2},
+        ),
+        # Z outermost (slow), T innermost (fast): every T value first appears
+        # while Z is still 0, even T=1.
+        (
+            [
+                {"Z": 0, "T": 0},
+                {"Z": 0, "T": 1},
+                {"Z": 1, "T": 0},
+                {"Z": 1, "T": 1},
+            ],
+            {0: 0, 1: 1},
+        ),
+    ],
+)
+def test_first_seq_index_per_t(loop_indices, expected):
+    assert M._first_seq_index_per_t(loop_indices) == expected
+
+
+class _FakeChannel:
+    def __init__(self, jdn):
+        self.time = type("T", (), {"absoluteJulianDayNumber": jdn})()
+
+
+class _FakeFrameMeta:
+    def __init__(self, jdn):
+        self.channels = [_FakeChannel(jdn)]
+
+
+class _FakeND2:
+    """Enough of ND2File for _read_real_times: loop_indices + frame_metadata."""
+
+    def __init__(self, jdns_by_seq):
+        self.loop_indices = tuple({"T": t} for t in range(len(jdns_by_seq)))
+        self._jdns = jdns_by_seq
+
+    def frame_metadata(self, seq):
+        jdn = self._jdns[seq]
+        if jdn is None:
+            raise IndexError(f"frame {seq} was never written")
+        return _FakeFrameMeta(jdn)
+
+
+def test_read_real_times_converts_every_timepoint():
+    f = _FakeND2([2440587.5, 2440588.5])
+    assert M._read_real_times(f, 2, "f.nd2") == (0.0, 86400.0)
+
+
+def test_read_real_times_warns_and_gaps_on_a_skipped_step():
+    f = _FakeND2([2440587.5, None, 2440589.5])
+    with pytest.warns(RuntimeWarning, match="timepoint 1 has no recorded"):
+        times = M._read_real_times(f, 3, "f.nd2")
+    assert times == (0.0, None, 172800.0)

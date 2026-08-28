@@ -102,6 +102,20 @@ class Override:
 
 
 @attrs.define(kw_only=True)
+class Overview:
+    """A wide-field image to orient the stitched tiles within.
+
+    `channel` names an entry in overview.nd2's own multipoint experiment --
+    the same lookup `FileMeta.position_of` does for the tile files -- not a
+    fluorescence channel.
+    """
+
+    file: str
+    channel: str
+    label: bool = True
+
+
+@attrs.define(kw_only=True)
 class StitchingConfig:
     files: list[str]
     positions: dict[str, Position]
@@ -115,6 +129,7 @@ class StitchingConfig:
     shift_px: int | None = None
     slices: Slices3D = attrs.field(factory=_empty_slices)
     realignment_slices: Slices3D = attrs.field(factory=_empty_slices)
+    overview: Overview | None = None
 
     @property
     def n_files(self) -> int:

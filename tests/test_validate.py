@@ -218,3 +218,26 @@ def test_the_message_names_the_tiles(cfg_dict, parse):
     ]
     problems = check(parse(cfg_dict))
     assert any("['tile_a', 'tile_b']" in p for p in problems), problems
+
+
+# --- overview -------------------------------------------------------------------
+def test_no_overview_is_fine(cfg_dict, parse):
+    assert check(parse(cfg_dict)) == []
+
+
+def test_overview_with_file_and_channel_is_fine(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "overview.nd2", "channel": "pos1"}
+    assert check(parse(cfg_dict)) == []
+
+
+def test_overview_empty_channel_is_flagged(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "overview.nd2", "channel": ""}
+    problems = check(parse(cfg_dict))
+    assert any("overview.channel" in p for p in problems), problems
+
+
+def test_overview_missing_file_is_flagged_only_with_check_files(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "does-not-exist.nd2", "channel": "pos1"}
+    assert check(parse(cfg_dict)) == []
+    problems = check(parse(cfg_dict), check_files=True)
+    assert any("overview.file" in p for p in problems), problems

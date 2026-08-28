@@ -30,6 +30,7 @@ class FileMeta:
     position_names: tuple[str, ...]
     stage_um: tuple[tuple[float, float], ...]  # (x, y) per position, same order
     voxel_x_um: float
+    real_time_s: tuple[float | None, ...] = ()  # per local t; None if unrecorded
 
     def position_of(self, names: tuple[str, ...]) -> int | None:
         """Index of the single position matching any of `names`, or None."""
@@ -58,6 +59,65 @@ class Metadata:
         return tuple(f.nt for f in self.files)
 
 
+# --- absolute per-timepoint time -----------------------------------------------
+# A Julian Day Number is already an absolute clock (unlike the elapsed-seconds
+# columns nd2 also exposes), so it is what lets two different files be placed on
+# one real-world timeline. JDN 2440587.5 == 1970-01-01T00:00:00Z.
+_JDN_UNIX_EPOCH = 2440587.5
+
+# A skipped/aborted timepoint means `loop_indices` names a frame that was never
+# actually written. Reading its metadata is expected to fail; that failure is
+# the signal, not a reason to give up on the rest of the file. Exact type is a
+# best guess reasoned from nd2's public API, not observed against a real
+# aborted acquisition -- narrow or widen this if a real one raises otherwise.
+_FRAME_READ_ERRORS = (IndexError, KeyError, ValueError)
+
+
+def _jdn_to_unix_s(jdn: float) -> float:
+    """Julian Day Number -> POSIX seconds."""
+    return (jdn - _JDN_UNIX_EPOCH) * 86400.0
+
+
+def _first_seq_index_per_t(loop_indices) -> dict[int, int]:
+    """For each T value, the seq_index of its first frame.
+
+    `loop_indices` enumerates every *nominal* frame combination in nd2's own
+    loop order (T, Z, C, P, ...). Regardless of that order, the first frame at
+    which any given T value appears always has every other axis still at its
+    initial 0 -- a property of the underlying itertools.product, not of any
+    particular loop nesting -- so this is always (T=t, Z=0, C=0, P=0) without
+    needing to know the loop order.
+    """
+    out: dict[int, int] = {}
+    for i, idx in enumerate(loop_indices):
+        out.setdefault(idx.get("T", 0), i)
+    return out
+
+
+def _read_real_times(f, nt: int, path: str) -> tuple[float | None, ...]:
+    """One representative absolute timestamp per T value, None where missing."""
+    t_to_seq = _first_seq_index_per_t(f.loop_indices)
+    times: list[float | None] = []
+    for t in range(nt):
+        seq = t_to_seq.get(t)
+        if seq is None:
+            times.append(None)
+            continue
+        try:
+            jdn = f.frame_metadata(seq).channels[0].time.absoluteJulianDayNumber
+        except _FRAME_READ_ERRORS as e:
+            warnings.warn(
+                f"{path}: timepoint {t} has no recorded frame metadata "
+                f"({type(e).__name__}); its real time is unknown",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            times.append(None)
+            continue
+        times.append(_jdn_to_unix_s(jdn))
+    return tuple(times)
+
+
 def read_metadata(paths) -> Metadata:
     """Open each ND2 just long enough to read its headers."""
     import nd2
@@ -66,10 +126,11 @@ def read_metadata(paths) -> Metadata:
     for path in paths:
         with nd2.ND2File(str(path)) as f:
             points = f.experiment[1].parameters.points
+            nt = f.sizes.get("T", 1)
             metas.append(
                 FileMeta(
                     path=str(path),
-                    nt=f.sizes.get("T", 1),
+                    nt=nt,
                     nz=f.sizes["Z"],
                     ny=f.sizes["Y"],
                     nx=f.sizes["X"],
@@ -78,6 +139,7 @@ def read_metadata(paths) -> Metadata:
                         (p.stagePositionUm.x, p.stagePositionUm.y) for p in points
                     ),
                     voxel_x_um=f.voxel_size().x,
+                    real_time_s=_read_real_times(f, nt, str(path)),
                 )
             )
     return Metadata(tuple(metas))

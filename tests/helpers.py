@@ -35,6 +35,8 @@ def make_meta(
                 position_names=tuple(tiles),
                 stage_um=tuple(stage),
                 voxel_x_um=voxel,
+                # Plausible, strictly increasing real times: 60s per file, 1s per t.
+                real_time_s=tuple(i * 60.0 + t for t in range(nt)),
             )
             for i in range(n_files)
         )

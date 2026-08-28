@@ -173,6 +173,18 @@ def _check_timeline(cfg: StitchingConfig, nts, p: list[str]) -> None:
                     p.append(f"overrides[{i}]: t={t} is before '{name}' starts")
 
 
+def _check_overview(cfg: StitchingConfig, p: list[str], check_files: bool) -> None:
+    ov = cfg.overview
+    if ov is None:
+        return
+    if not ov.file:
+        p.append("overview.file: empty")
+    elif check_files and not Path(ov.file).exists():
+        p.append(f"overview.file: {ov.file} does not exist")
+    if not ov.channel:
+        p.append("overview.channel: empty")
+
+
 def check(cfg: StitchingConfig, nts=None, check_files: bool = False) -> list[str]:
     """Return every problem found. Empty list == config is internally consistent."""
     p: list[str] = []
@@ -198,6 +210,7 @@ def check(cfg: StitchingConfig, nts=None, check_files: bool = False) -> list[str
     _check_coverage(cfg, p)
     _check_overrides(cfg, p)
     _check_realign(cfg, p)
+    _check_overview(cfg, p, check_files)
     if nts is not None:
         _check_timeline(cfg, list(nts), p)
     return p

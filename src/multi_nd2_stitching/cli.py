@@ -499,6 +499,71 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+def cmd_times(args) -> int:
+    from .times import WRITERS, build_time_table
+
+    ws, _cfg, meta, layout = _prepare(args, need_metadata=True)
+    rows = build_time_table(layout, meta)
+
+    out = args.out or (ws.root / f"times.{args.format}")
+    WRITERS[args.format](rows, out)
+
+    skipped = [r.t for r in rows if r.skipped]
+    print(f"wrote      {out}")
+    print(f"timepoints {len(rows)}  ({len(skipped)} with no recorded real time)")
+    if skipped:
+        print(
+            f"skipped    t={skipped[0]}..{skipped[-1]}"
+            if len(skipped) > 1
+            else f"skipped    t={skipped[0]}",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_overview(args) -> int:
+    from .metadata import read_metadata
+    from .overview import (
+        marker_positions,
+        normalize_to_uint8,
+        read_overview_plane,
+        render_overview,
+    )
+
+    ws, cfg, meta, _layout = _prepare(args, need_metadata=True)
+
+    overview_file = args.overview_file or (cfg.overview and cfg.overview.file)
+    channel = args.channel or (cfg.overview and cfg.overview.channel)
+    label = cfg.overview.label if cfg.overview else True
+    if not overview_file or not channel:
+        print(
+            "overview: need a file and a channel, from overview: in the config "
+            "or --overview-file/--channel",
+            file=sys.stderr,
+        )
+        return 1
+
+    overview_meta = read_metadata([overview_file])[0]
+    idx = overview_meta.position_of((channel,))
+    if idx is None:
+        print(
+            f"'{channel}' is not a position in {overview_file}; "
+            f"known: {overview_meta.position_names}",
+            file=sys.stderr,
+        )
+        return 1
+
+    markers = marker_positions(cfg, meta, overview_meta, channel)
+    plane = read_overview_plane(overview_file, idx)
+    image = normalize_to_uint8(plane)
+
+    out = args.out or (ws.root / "overview.png")
+    render_overview(image, markers, out, label=label)
+    print(f"wrote      {out}")
+    print(f"markers    {len(markers)} tile(s) at position '{channel}'")
+    return 0
+
+
 def cmd_drift(args) -> int:
     import numpy as np
 
@@ -784,6 +849,32 @@ def build_parser() -> argparse.ArgumentParser:
     dr.add_argument("--open-files", type=int, default=2)
     dr.add_argument("--no-progress", action="store_true")
     dr.set_defaults(func=cmd_drift)
+
+    tm = common(
+        sub.add_parser(
+            "times", help="one real-world time per global timepoint of the canvas"
+        )
+    )
+    tm.add_argument(
+        "--format",
+        choices=("csv", "npy", "parquet"),
+        default="csv",
+        help="csv/npy always work; parquet needs pyarrow installed",
+    )
+    tm.add_argument("--out", type=Path, help="defaults to <workspace>/times.<format>")
+    tm.set_defaults(func=cmd_times)
+
+    ov = common(
+        sub.add_parser(
+            "overview", help="PNG of an overview image with tile positions marked"
+        )
+    )
+    ov.add_argument(
+        "--channel", help="XY position name in overview.nd2; overrides overview.channel"
+    )
+    ov.add_argument("--overview-file", type=Path, help="overrides overview.file")
+    ov.add_argument("--out", type=Path, help="defaults to <workspace>/overview.png")
+    ov.set_defaults(func=cmd_overview)
     return ap
 
 

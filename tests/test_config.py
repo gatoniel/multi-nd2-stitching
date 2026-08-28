@@ -25,10 +25,23 @@ def test_position_optional_absent(cfg_dict, parse, field, expected):
         ("flip_x", False),
         ("flip_y", False),
         ("overrides", []),
+        ("overview", None),
     ],
 )
 def test_toplevel_optional_absent(cfg_dict, parse, field, expected):
     cfg_dict.pop(field, None)
+    assert getattr(parse(cfg_dict), field) == expected
+
+
+@pytest.mark.parametrize(
+    "field,expected",
+    [
+        ("shift_px", None),
+        ("overview", None),
+    ],
+)
+def test_toplevel_optional_explicit_null(cfg_dict, parse, field, expected):
+    cfg_dict[field] = None
     assert getattr(parse(cfg_dict), field) == expected
 
 
@@ -139,3 +152,17 @@ def test_clamp_z(stop, min_nz, expected):
 def test_clamp_z_leaves_yx_alone():
     yx = (slice(300, 724), slice(1, 2))
     assert clamp_z((slice(5, 100), *yx), 60)[1:] == yx
+
+
+# --- overview -------------------------------------------------------------------
+def test_overview_present(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "overview.nd2", "channel": "pos1"}
+    ov = parse(cfg_dict).overview
+    assert ov.file == "overview.nd2"
+    assert ov.channel == "pos1"
+    assert ov.label is True
+
+
+def test_overview_label_can_be_disabled(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "o.nd2", "channel": "p1", "label": False}
+    assert parse(cfg_dict).overview.label is False
