@@ -167,6 +167,59 @@ def test_a_change_in_topology_starts_a_new_run(scene):
     assert any(a == b == 3 for a, b, _ in runs)
 
 
+# --- shaped_peak ------------------------------------------------------------
+def test_shaped_peak_pair_marks_that_step(scene):
+    lay = chain(scene, overrides=[{"at": 1, "shaped_peak": ["a,b"]}], nt=3)
+    p = plan_placement(lay, 1)
+    step = p.by_tile["b"]
+    assert step.shaped
+    assert not p.by_tile["a"].shaped  # a's own drift step is unaffected
+    assert p.has_shaped
+
+
+def test_shaped_peak_pair_matches_either_order(scene):
+    lay = chain(scene, overrides=[{"at": 1, "shaped_peak": ["b,a"]}], nt=3)
+    assert plan_placement(lay, 1).by_tile["b"].shaped
+
+
+def test_shaped_peak_tile_name_marks_the_drift_step(scene):
+    lay = chain(scene, overrides=[{"at": 1, "shaped_peak": ["a"]}], nt=3)
+    p = plan_placement(lay, 1)
+    assert p.by_tile["a"].shaped
+    assert not p.by_tile["b"].shaped
+
+
+def test_shaped_peak_never_marks_an_origin(scene):
+    """No correlation happens for the seed at t=0, shaped_peak or not."""
+    lay = chain(scene, overrides=[{"at": 0, "shaped_peak": ["a"]}], nt=3)
+    p = plan_placement(lay, 0)
+    assert not p.by_tile["a"].shaped
+
+
+def test_shaped_peak_breaks_a_run_even_though_topology_is_unchanged(scene):
+    lay = chain(scene, overrides=[{"at": 3, "shaped_peak": ["a,b"]}], nt=6)
+    runs = group_runs(placements_for(lay))
+    assert any(a == b == 3 for a, b, _ in runs), runs
+
+
+def test_render_marks_shaped_peak(scene):
+    lay = chain(scene, overrides=[{"at": 3, "shaped_peak": ["a,b"]}], nt=6)
+    text = "\n".join(render(placements_for(lay)))
+    assert "t=3  [SHAPED_PEAK]" in text
+    assert "b  [shaped_peak]" in text
+
+
+def test_render_tile_mode_marks_shaped_peak(scene):
+    lay = chain(scene, overrides=[{"at": 3, "shaped_peak": ["a,b"]}], nt=6)
+    text = "\n".join(render(placements_for(lay), tile="b"))
+    assert "[shaped_peak]" in text
+
+
+def test_render_is_quiet_without_shaped_peak(scene):
+    text = "\n".join(render(placements_for(chain(scene))))
+    assert "SHAPED_PEAK" not in text and "shaped_peak" not in text
+
+
 # --- rendering ----------------------------------------------------------------
 def test_render_marks_ambiguous_runs(scene):
     lay = scene(

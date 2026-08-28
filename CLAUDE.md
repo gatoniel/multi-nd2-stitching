@@ -121,6 +121,12 @@ boundaries or zarr read-modify-writes every partial chunk.
 
 - `end` in a position is an **exclusive file index**, while `start` is a
   `(file, timepoint)` pair. The asymmetry is a trap.
+- `stop_at` (config-level) is an **exclusive global timepoint**, same
+  convention as `end`. It truncates `layout.nt` at build time; everything
+  downstream already loops over `layout.nt` rather than raw metadata, so
+  truncation is free everywhere except code that loops over `cfg.n_files`
+  directly (`stitch timeline`'s per-file table has to skip files whose start
+  is past it, or `tiles_at()` indexes straight past the truncated mask).
 - Drift is absolute: placing timepoint `t` needs every drift step from 0.
   Pair offsets are local to their timepoint.
 - The `nd2` handle is not thread-safe. Never peek into the handle pool
@@ -131,3 +137,17 @@ boundaries or zarr read-modify-writes every partial chunk.
 - Measure before attributing a slowdown. Several plausible causes in this
   codebase turned out to be noise; the real ones were unaligned zarr writes and
   whole-canvas passes.
+
+## Planned work
+
+Not designed in detail yet; recorded here so the reasoning survives until
+someone picks it up.
+
+- **B. Corner overlaps get no feather blend.** Two tiles can overlap across a
+  corner (diagonal, no shared edge) without a third tile there to anchor
+  that corner. `layout._discover_pairs` only creates a `Pair` for
+  edge-adjacent tiles, and `blend_weights` only tapers a tile's edge where a
+  `Pair` exists for that axis — so a corner with no pair gets full (1.0)
+  weight from both tiles regardless of overlap, and the seam shows in the
+  blended canvas. Needs a way to detect corner overlaps with no defining
+  third neighbour and taper both tiles' weight there too.

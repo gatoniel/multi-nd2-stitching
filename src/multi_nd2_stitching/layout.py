@@ -42,6 +42,7 @@ class Layout:
     nts: tuple[int, ...]
     file_start: tuple[int, ...]  # global t at which each file begins
     nt: int
+    raw_nt: int  # nt before any stop_at truncation; nt itself for reporting only
     nz: int  # min stack depth across files
     ny: int
     nx: int
@@ -127,7 +128,13 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
 
     nts = meta.nts
     file_start = tuple(int(s) for s in np.concatenate([[0], np.cumsum(nts)[:-1]]))
-    nt = int(sum(nts))
+    raw_nt = int(sum(nts))
+    # An experiment can end before the acquisition does; stop_at truncates the
+    # *effective* timeline right here, so nothing downstream -- masks below,
+    # build_plan, coordinates, blend -- ever sees a timepoint past it. They
+    # all already loop over `layout.nt`, never raw metadata, so this one
+    # change is enough; no per-module truncation logic needed anywhere else.
+    nt = raw_nt if cfg.stop_at is None else min(raw_nt, cfg.stop_at)
 
     # --- tiles ------------------------------------------------------------
     tiles = tuple(sorted(cfg.positions))
@@ -204,6 +211,7 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
         nts=nts,
         file_start=file_start,
         nt=nt,
+        raw_nt=raw_nt,
         nz=min(f.nz for f in meta.files),
         ny=nys.pop(),
         nx=nxs.pop(),

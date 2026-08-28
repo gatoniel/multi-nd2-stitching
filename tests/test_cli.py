@@ -439,6 +439,50 @@ def test_inspect_writes_arrays_napari_can_open(project, tmp_path, capsys):
     assert info["t"] == 1 and len(info["measured_offset"]) == 3
 
 
+def test_inspect_candidates_csv_has_exactly_one_taken_row(project, tmp_path, capsys):
+    import csv
+    import json
+
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "look"
+    assert run("inspect", project, "--at", 1, "--out", out) == 0
+    text = capsys.readouterr().out
+    assert "candidates" in text and "drop-off" in text
+
+    d = next((out / "t1").iterdir())
+    rows = list(csv.DictReader((d / "candidates.csv").open()))
+    assert rows and rows[0].keys() == {
+        "rank",
+        "dz",
+        "dy",
+        "dx",
+        "value",
+        "decay",
+        "taken",
+    }
+    taken = [r for r in rows if r["taken"] == "1"]
+    assert len(taken) == 1
+
+    info = json.loads((d / "info.json").read_text())
+    measured = tuple(info["measured_offset"])
+    assert (int(taken[0]["dz"]), int(taken[0]["dy"]), int(taken[0]["dx"])) == measured
+
+
+def test_inspect_profiles_csv_covers_every_candidate_and_axis(project, tmp_path):
+    import csv
+
+    run("offsets", project, "--no-progress")
+    out = tmp_path / "look"
+    run("inspect", project, "--at", 1, "--out", out)
+    d = next((out / "t1").iterdir())
+    rows = list(csv.DictReader((d / "profiles.csv").open()))
+    assert rows[0].keys() == {"rank", "axis", "step", "value"}
+    assert {r["axis"] for r in rows} == {"z", "y", "x"}
+    ranks = {int(r["rank"]) for r in rows}
+    assert ranks == set(range(1, len(ranks) + 1))  # every candidate covered
+
+
 def test_inspect_measured_has_two_layers(project, tmp_path):
     import zarr
 
@@ -487,6 +531,8 @@ def test_no_response_skips_that_array(project, tmp_path):
     run("inspect", project, "--at", 1, "--out", out, "--no-response")
     d = next((out / "t1").iterdir())
     assert not (d / "response.zarr").exists()
+    assert not (d / "candidates.csv").exists()
+    assert not (d / "profiles.csv").exists()
     assert (d / "measured.zarr").exists()
 
 
@@ -670,6 +716,48 @@ def test_timeline_shows_anchors_per_file(project, capsys):
     assert "tile_a" in capsys.readouterr().out
 
 
+# --- stop_at --------------------------------------------------------------------
+def test_validate_reports_stop_at_truncation(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["stop_at"] = 5
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("validate", project, "--deep") == 0
+    out = capsys.readouterr().out
+    assert "stopped" in out and "t=5" in out
+
+
+def test_validate_says_nothing_extra_without_stop_at(project, capsys):
+    assert run("validate", project, "--deep") == 0
+    assert "stopped" not in capsys.readouterr().out
+
+
+def test_timeline_reports_stop_at_and_marks_excluded_files(project, capsys):
+    """nt=4 per file, 2 files -> file 1 starts at t=4; stop_at=4 excludes it
+    entirely, which used to crash tiles_at() on the truncated mask."""
+    cfg = yaml.safe_load(project.read_text())
+    cfg["stop_at"] = 4
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("timeline", project) == 0
+    out = capsys.readouterr().out
+    assert "beyond stop_at" in out
+    assert "stopped" in out and "t=4" in out
+
+
+def test_timeline_says_nothing_extra_without_stop_at(project, capsys):
+    run("timeline", project)
+    out = capsys.readouterr().out
+    assert "stopped" not in out and "beyond stop_at" not in out
+
+
+def test_stop_at_shrinks_the_task_count(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["stop_at"] = 4
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("status", project) == 0
+    out = capsys.readouterr().out
+    assert "pending 7" in out  # 4 pair + 3 drift, vs. 15 for the full 8 timepoints
+
+
 def test_timeline_at_resolves_a_global_timepoint(project, capsys):
     assert run("timeline", project, "--at", 5) == 0
     out = capsys.readouterr().out
@@ -765,6 +853,37 @@ def test_graph_flags_a_dropped_tile(project, capsys, tmp_path, monkeypatch):
     run("graph", project)
     out = capsys.readouterr().out
     assert "t=3" in out
+
+
+def test_graph_flags_shaped_peak(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["overrides"] = [{"at": 3, "shaped_peak": ["tile_a,tile_b"]}]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("graph", project) == 0
+    out = capsys.readouterr().out
+    assert "t=3  [SHAPED_PEAK]" in out
+    assert "[shaped_peak]" in out
+
+
+def test_graph_quiet_about_shaped_peak_when_unused(project, capsys):
+    run("graph", project)
+    out = capsys.readouterr().out
+    assert "SHAPED_PEAK" not in out and "shaped_peak" not in out
+
+
+def test_validate_deep_flags_a_shaped_peak_pair_not_alive(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["overrides"] = [{"at": 3, "drop": ["tile_b"], "shaped_peak": ["tile_a,tile_b"]}]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("validate", project, "--deep") == 1
+    assert "not alive at t=3" in capsys.readouterr().err
+
+
+def test_validate_deep_is_fine_with_a_live_shaped_peak_pair(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["overrides"] = [{"at": 3, "shaped_peak": ["tile_a,tile_b"]}]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("validate", project, "--deep") == 0
 
 
 def test_graph_strict_exits_nonzero_on_ambiguity(project, capsys, monkeypatch):

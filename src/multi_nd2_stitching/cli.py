@@ -17,7 +17,7 @@ from .layout import build_layout
 from .metadata import load_metadata
 from .offsets import PairTask, build_plan, file_keys
 from .store import OffsetStore
-from .validate import check, check_layout
+from .validate import check, check_layout, check_shaped_peak
 from .workspace import Workspace
 
 
@@ -44,7 +44,10 @@ def _prepare(args, *, need_metadata: bool):
     ws.create()
     meta = load_metadata(cfg.files, cache=ws.metadata)
     layout = build_layout(cfg, meta)
-    _report(check(cfg, nts=meta.nts) + check_layout(layout), str(args.config))
+    _report(
+        check(cfg, nts=meta.nts) + check_layout(layout) + check_shaped_peak(layout),
+        str(args.config),
+    )
     return ws, cfg, meta, layout
 
 
@@ -67,6 +70,11 @@ def cmd_validate(args) -> int:
         f"{args.config}: OK  ({cfg.n_files} files, {len(cfg.positions)} positions, "
         f"{len(cfg.overrides)} override(s){extra}) [{tier}]"
     )
+    if layout is not None and layout.raw_nt > layout.nt:
+        print(
+            f"stopped    at t={layout.nt} ({layout.raw_nt - layout.nt} more "
+            "timepoint(s) in the files, not processed)"
+        )
     return 0
 
 
@@ -97,6 +105,15 @@ def cmd_timeline(args) -> int:
     for i in range(cfg.n_files):
         start = layout.file_start[i]
         n = layout.nts[i]
+        if start >= layout.nt:
+            # Entirely past stop_at: layout has no rows for this file at all,
+            # so tiles_at(start) would index straight past the truncated mask.
+            print(
+                f"{i:>4}  {f'{start}..{start + n - 1}':>{span_w}}  {n:>5}  "
+                f"{'-':>5}  {'(beyond stop_at)':<18}  "
+                f"{Path(cfg.files[i]).name:<{name_w}}"
+            )
+            continue
         anchors = (
             layout.references_for_file(i)
             if hasattr(layout, "references_for_file")
@@ -109,6 +126,11 @@ def cmd_timeline(args) -> int:
             f"{Path(cfg.files[i]).name:<{name_w}}"
         )
     print(f"{'':>4}  {'':>{span_w}}  {layout.nt:>5}  total")
+    if layout.raw_nt > layout.nt:
+        print(
+            f"stopped    at t={layout.nt} ({layout.raw_nt - layout.nt} more "
+            "timepoint(s) in the files, not processed)"
+        )
     return 0
 
 
@@ -496,6 +518,9 @@ def cmd_inspect(args) -> int:
 
     print(f"\nwrote {len(written)} pair(s) under {root}")
     print("napari " + " ".join(str(w / "measured.zarr") for w in written[:3]))
+    if not args.no_response:
+        print(f"candidates  {written[0] / 'candidates.csv'}")
+        print(f"drop-off    {written[0] / 'profiles.csv'}")
     return 0
 
 

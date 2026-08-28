@@ -30,6 +30,7 @@ class Step:
     kind: str
     via: str | None = None
     axis: int | None = None
+    shaped: bool = False  # this step's offset used the shaped_peak override
 
     @property
     def label(self) -> str:
@@ -62,6 +63,10 @@ class Placement:
     def ambiguous(self) -> bool:
         return bool(self.redundant or self.over_anchored)
 
+    @property
+    def has_shaped(self) -> bool:
+        return any(s.shaped for s in self.steps)
+
     def children(self) -> dict[str | None, list[Step]]:
         out: dict[str | None, list[Step]] = {}
         for s in self.steps:
@@ -69,9 +74,12 @@ class Placement:
         return out
 
     def signature(self):
-        """Topology only -- used to collapse runs of identical timepoints."""
+        """Topology (plus shaped_peak status) -- used to collapse runs of
+        identical timepoints. shaped_peak doesn't change the topology, but a
+        run turning it on or off is exactly the kind of change this exists to
+        surface, so it breaks the run like anything else would."""
         return (
-            tuple((s.tile, s.kind, s.via, s.axis) for s in self.steps),
+            tuple((s.tile, s.kind, s.via, s.axis, s.shaped) for s in self.steps),
             self.redundant,
             self.unplaced,
             self.over_anchored,
@@ -102,6 +110,13 @@ def plan_placement(layout, t: int, seeded=None) -> Placement:
     if not alive:
         return Placement(t=t, steps=())
 
+    # shaped_peak names either a bare tile (a drift step) or an "a,b" pair (a
+    # neighbour edge, either order) -- see StitchingConfig.shaped_peak_at.
+    shaped_names = layout.config.shaped_peak_at(t)
+
+    def pair_shaped(a: str, b: str) -> bool:
+        return f"{a},{b}" in shaped_names or f"{b},{a}" in shaped_names
+
     anchors = [n for n in layout.anchors_at(t) if seeded is None or n in seeded]
     steps: list[Step] = []
     placed: set[str] = set()
@@ -113,7 +128,7 @@ def plan_placement(layout, t: int, seeded=None) -> Placement:
     else:
         for name in anchors:
             if layout.tile_alive[t - 1, layout.ti(name)]:
-                steps.append(Step(name, DRIFT))
+                steps.append(Step(name, DRIFT, shaped=name in shaped_names))
                 placed.add(name)
         if not placed:
             steps.append(Step(alive[0], ORIGIN))
@@ -135,11 +150,15 @@ def plan_placement(layout, t: int, seeded=None) -> Placement:
             redundant.append((p.a, p.b, p.axis))
             stalled += 1
         elif p.a in placed:
-            steps.append(Step(p.b, PAIR, via=p.a, axis=p.axis))
+            steps.append(
+                Step(p.b, PAIR, via=p.a, axis=p.axis, shaped=pair_shaped(p.a, p.b))
+            )
             placed.add(p.b)
             stalled = 0
         elif p.b in placed:
-            steps.append(Step(p.a, PAIR, via=p.b, axis=p.axis))
+            steps.append(
+                Step(p.a, PAIR, via=p.b, axis=p.axis, shaped=pair_shaped(p.a, p.b))
+            )
             placed.add(p.a)
             stalled = 0
         else:
@@ -204,13 +223,14 @@ def render_tree(placement: Placement, indent: str = "  ") -> list[str]:
     lines: list[str] = []
 
     def walk(step: Step, prefix: str, last: bool, root: bool):
+        tag = "  [shaped_peak]" if step.shaped else ""
         if root:
-            lines.append(f"{indent}{step.tile}  [{step.label}]")
+            lines.append(f"{indent}{step.tile}  [{step.label}]{tag}")
             new_prefix = indent
         else:
             arm = "└─" if last else "├─"
             axis = "y" if step.axis == 1 else "x"
-            lines.append(f"{prefix}{arm}{axis}→ {step.tile}")
+            lines.append(f"{prefix}{arm}{axis}→ {step.tile}{tag}")
             new_prefix = prefix + ("   " if last else "│  ")
         kids = sorted(children.get(step.tile, []), key=lambda s: (s.axis, s.tile))
         for i, kid in enumerate(kids):
@@ -226,7 +246,12 @@ def render(placements, tile: str | None = None, indent: str = "  ") -> list[str]
     for t0, t1, p in group_runs(placements):
         span = f"t={t0}" if t0 == t1 else f"t={t0}..{t1}"
         count = "" if t0 == t1 else f"  ({t1 - t0 + 1} timepoints)"
-        flag = "  [AMBIGUOUS]" if p.ambiguous else ""
+        flags = [
+            f
+            for f, on in (("AMBIGUOUS", p.ambiguous), ("SHAPED_PEAK", p.has_shaped))
+            if on
+        ]
+        flag = f"  [{', '.join(flags)}]" if flags else ""
         lines.append(f"{span}{count}{flag}")
         if tile is not None:
             chain = p.route_to(tile)
@@ -236,9 +261,12 @@ def render(placements, tile: str | None = None, indent: str = "  ") -> list[str]
                 lines.append(
                     indent
                     + " → ".join(
-                        f"{s.tile}[{s.label}]"
-                        if s.via is None
-                        else f"{'y' if s.axis == 1 else 'x'}→ {s.tile}"
+                        (
+                            f"{s.tile}[{s.label}]"
+                            if s.via is None
+                            else f"{'y' if s.axis == 1 else 'x'}→ {s.tile}"
+                        )
+                        + ("  [shaped_peak]" if s.shaped else "")
                         for s in chain
                     )
                 )

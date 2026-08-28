@@ -56,6 +56,42 @@ def test_realign_flag_and_crop(cfg_dict, tmp_path):
     assert next(t for t in p.time_tasks if not t.realign).crop.z == (0, 20)
 
 
+def test_shaped_peak_tile_name_flags_only_that_timepoint(cfg_dict, tmp_path):
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    cfg_dict["overrides"] = [{"at": 4, "shaped_peak": ["tile_a"]}]
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    p = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+    flagged = [t for t in p.time_tasks if t.shaped_peak]
+    assert [t.t_to for t in flagged] == [4]
+
+
+@pytest.mark.parametrize("pair", ["tile_a,tile_b", "tile_b,tile_a"])
+def test_shaped_peak_pair_flags_either_order(cfg_dict, tmp_path, pair):
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    cfg_dict["overrides"] = [{"at": 3, "shaped_peak": [pair]}]
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    p = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+    flagged = [t for t in p.pair_tasks if t.shaped_peak]
+    assert [t.t for t in flagged] == [3]
+
+
+def test_shaped_peak_changes_the_key(plan):
+    """The whole design: a different computation needs a different cache slot."""
+    p, cfg, meta = plan
+    cfg2 = {**cfg, "overrides": [{"at": 3, "shaped_peak": ["tile_a,tile_b"]}]}
+    q = build_plan(build(cfg2, n_files=2, nt=5, paths=cfg["files"]), meta)
+    shaped = next(t for t in q.pair_tasks if t.t == 3)
+    plain = next(t for t in p.pair_tasks if t.t == 3)
+    assert shaped.shaped_peak and not plain.shaped_peak
+    assert shaped.key != plain.key
+    # every other pair task at every other timepoint is untouched
+    others_p = {t.key for t in p.pair_tasks if t.t != 3}
+    others_q = {t.key for t in q.pair_tasks if t.t != 3}
+    assert others_p == others_q
+
+
 # --- key behaviour: this is the whole design ----------------------------------
 def test_key_is_stable_across_rebuilds(plan):
     p, cfg, meta = plan

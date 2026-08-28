@@ -7,12 +7,24 @@ at.
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
 import numpy as np
 
-from .compute import spectrum, trim_for
+from .compute import (
+    SHAPED_PEAK_CANDIDATES,
+    axis_profile,
+    candidate_peaks,
+    correlation_surface,
+    spectrum,
+    to_signed_shift,
+    trim_for,
+)
+
+_AXIS_NAME = ("z", "y", "x")
+_PROFILE_RADIUS = 8
 
 
 def _place(a, b, shift_zyx, tile_shape):
@@ -100,17 +112,17 @@ def inspect_pair(
     if response:
         f0 = spectrum(strip_a, precision=task.precision)
         f1 = spectrum(strip_b, precision=task.precision)
-        mult = f0 * np.conjugate(f1)
-        np.divide(mult, np.abs(mult), out=mult)
-        import scipy.fft as spfft
-
-        surface = spfft.irfftn(mult, s=strip_a.shape, axes=[0, 1, 2])
+        surface = correlation_surface(f0, f1, strip_a.shape)
         save(
             "response",
             np.fft.fftshift(surface).astype(np.float32),
             note="peak-centred: a shift of zero sits at the array centre",
             centre=[int(v) // 2 for v in strip_a.shape],
         )
+
+        nominal_shift = np.zeros(3, dtype=int)
+        nominal_shift[task.axis] = task.shift_px
+        _write_candidate_csvs(out_dir, surface, strip_a.shape, nominal_shift, measured)
 
     (out_dir / "info.json").write_text(
         json.dumps(
@@ -125,6 +137,7 @@ def inspect_pair(
                     "x": list(task.crop.x),
                 },
                 "measured_offset": [int(v) for v in measured],
+                "shaped_peak": task.shaped_peak,
                 "tile_shape": [int(v) for v in tile_shape],
                 "strip_shape": [int(v) for v in strip_a.shape],
             },
@@ -132,6 +145,37 @@ def inspect_pair(
         )
     )
     return out_dir
+
+
+def _write_candidate_csvs(out_dir, surface, shape, nominal_shift, measured) -> None:
+    """candidates.csv + profiles.csv: what the response actually offered, not
+    just what got picked.
+
+    `candidates.csv` lists the same `SHAPED_PEAK_CANDIDATES` points the real
+    `shaped_peak` override would consider -- so this is exactly what that
+    override sees, not a separately-tuned debug view. `profiles.csv` gives
+    each candidate's drop-off curve along every axis, to plot "does this
+    actually look like a peak" without needing a plot exported for you.
+    """
+    cands = candidate_peaks(surface, candidates=SHAPED_PEAK_CANDIDATES)
+    shifts = [np.array(to_signed_shift(c.index, shape)) + nominal_shift for c in cands]
+
+    with (out_dir / "candidates.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "dz", "dy", "dx", "value", "decay", "taken"])
+        for rank, (c, shift) in enumerate(zip(cands, shifts, strict=True), start=1):
+            taken = int(np.array_equal(shift, measured))
+            w.writerow([rank, *(int(v) for v in shift), c.value, c.decay, taken])
+
+    with (out_dir / "profiles.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "axis", "step", "value"])
+        steps = range(-_PROFILE_RADIUS, _PROFILE_RADIUS + 1)
+        for rank, c in enumerate(cands, start=1):
+            for axis, name in enumerate(_AXIS_NAME):
+                profile = axis_profile(surface, c.index, axis, radius=_PROFILE_RADIUS)
+                for step, value in zip(steps, profile, strict=True):
+                    w.writerow([rank, name, step, float(value)])
 
 
 def _project(vol, axis: int):
@@ -252,23 +296,19 @@ def inspect_drift(
             if prev_strip is not None:
                 f0 = spectrum(prev_strip, precision=task.precision)
                 f1 = spectrum(vol, precision=task.precision)
-                mult = f0 * np.conjugate(f1)
-                np.divide(mult, np.abs(mult), out=mult)
-                import scipy.fft as spfft
-
-                surf = spfft.irfftn(mult, s=vol.shape, axes=[0, 1, 2])
+                surf = correlation_surface(f0, f1, vol.shape)
                 arrays["response"][k - 1] = np.fft.fftshift(_project(surf, 0)).astype(
                     np.float32
                 )
             prev_strip = vol
 
-    rows = ["t,dz,dy,dx,cum_z,cum_y,cum_x,magnitude,realign"]
+    rows = ["t,dz,dy,dx,cum_z,cum_y,cum_x,magnitude,realign,shaped_peak"]
     for i, (task, off) in enumerate(steps):
         mag = float(np.linalg.norm([off.dz, off.dy, off.dx]))
         rows.append(
             f"{task.t_to},{off.dz},{off.dy},{off.dx},"
             f"{cum[i + 1][0]},{cum[i + 1][1]},{cum[i + 1][2]},"
-            f"{mag:.2f},{int(task.realign)}"
+            f"{mag:.2f},{int(task.realign)},{int(task.shaped_peak)}"
         )
     (out_dir / "offsets.csv").write_text("\n".join(rows) + "\n")
 

@@ -5,13 +5,55 @@ from helpers import build, make_meta
 
 from multi_nd2_stitching.config import loads_config
 from multi_nd2_stitching.layout import build_layout
-from multi_nd2_stitching.validate import check_layout
+from multi_nd2_stitching.validate import check_layout, check_shaped_peak
 
 
 # --- timeline -----------------------------------------------------------------
 def test_timeline_concatenates_files(cfg_dict):
     lay = build(cfg_dict, n_files=2, nt=5)
     assert (lay.nt, lay.file_start) == (10, (0, 5))
+
+
+# --- stop_at --------------------------------------------------------------------
+def test_stop_at_absent_leaves_nt_equal_to_raw_nt(cfg_dict):
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.nt == lay.raw_nt == 10
+
+
+def test_stop_at_truncates_nt(cfg_dict):
+    cfg_dict["stop_at"] = 7
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.nt == 7
+    assert lay.raw_nt == 10
+
+
+def test_stop_at_beyond_the_real_timeline_is_a_noop(cfg_dict):
+    cfg_dict["stop_at"] = 1000
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.nt == lay.raw_nt == 10
+
+
+def test_stop_at_shapes_the_masks(cfg_dict):
+    cfg_dict["stop_at"] = 7
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.tile_alive.shape[0] == 7
+    assert lay.is_anchor.shape[0] == 7
+    assert lay.pair_alive.shape[0] == 7
+
+
+def test_stop_at_tile_starting_past_it_is_never_alive(cfg_dict):
+    cfg_dict["stop_at"] = 3
+    cfg_dict["positions"]["tile_b"] = {"start": [1, 0]}  # global t=5
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert not any(lay.tile_alive[t, lay.ti("tile_b")] for t in range(lay.nt))
+
+
+def test_stop_at_open_ended_tile_stops_at_the_truncation(cfg_dict):
+    """last_t = nt for an open-ended tile -- it should end at the truncated
+    nt, not the file-derived total."""
+    cfg_dict["stop_at"] = 7
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.tile["tile_a"].last_t == 7
 
 
 @pytest.mark.parametrize(
@@ -202,6 +244,60 @@ def test_ranges_are_collapsed_in_messages(cfg_dict):
     }
     cfg_dict["overrides"] = [{"at": [3, 4, 5, 8], "drop": ["a1"]}]
     problems = check_layout(build(cfg_dict, tiles=("a", "a1", "a2")))
+    assert any("t=3-5, 8" in p for p in problems), problems
+
+
+# --- shaped_peak pairs ----------------------------------------------------------
+def test_shaped_peak_pair_alive_throughout_is_fine(cfg_dict):
+    cfg_dict["overrides"] = [{"at": 3, "shaped_peak": ["tile_a,tile_b"]}]
+    assert check_shaped_peak(build(cfg_dict)) == []
+
+
+def test_shaped_peak_pair_reversed_order_is_fine(cfg_dict):
+    cfg_dict["overrides"] = [{"at": 3, "shaped_peak": ["tile_b,tile_a"]}]
+    assert check_shaped_peak(build(cfg_dict)) == []
+
+
+def test_shaped_peak_bare_tile_name_is_not_this_checks_concern(cfg_dict):
+    cfg_dict["overrides"] = [{"at": 3, "shaped_peak": ["tile_a"]}]
+    assert check_shaped_peak(build(cfg_dict)) == []
+
+
+def test_shaped_peak_flags_a_pair_that_never_exists(cfg_dict):
+    """a and a2 are never adjacent (a1 sits between them), so 'a,a2' never
+    names a real neighbour edge at any timepoint."""
+    cfg_dict["positions"] = {
+        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
+        "a1": {"start": [0, 0]},
+        "a2": {"start": [0, 0]},
+    }
+    cfg_dict["overrides"] = [{"at": 3, "shaped_peak": ["a,a2"]}]
+    problems = check_shaped_peak(build(cfg_dict, tiles=("a", "a1", "a2")))
+    assert any("not a discovered neighbour pair" in p for p in problems), problems
+
+
+def test_shaped_peak_flags_a_pair_not_alive_at_that_time(cfg_dict):
+    cfg_dict["overrides"] = [
+        {"at": 3, "drop": ["tile_b"], "shaped_peak": ["tile_a,tile_b"]}
+    ]
+    problems = check_shaped_peak(build(cfg_dict))
+    assert any("not alive at t=3" in p for p in problems), problems
+
+
+def test_shaped_peak_pair_alive_at_some_but_not_all_named_timepoints(cfg_dict):
+    cfg_dict["overrides"] = [
+        {"at": [3, 4, 5], "drop": ["tile_b"]},
+        {"at": [2, 3, 4, 5, 6], "shaped_peak": ["tile_a,tile_b"]},
+    ]
+    problems = check_shaped_peak(build(cfg_dict))
+    assert any("not alive at t=3-5" in p for p in problems), problems
+
+
+def test_shaped_peak_pair_dead_ranges_are_collapsed_in_the_message(cfg_dict):
+    cfg_dict["overrides"] = [
+        {"at": [3, 4, 5, 8], "drop": ["tile_b"], "shaped_peak": ["tile_a,tile_b"]}
+    ]
+    problems = check_shaped_peak(build(cfg_dict))
     assert any("t=3-5, 8" in p for p in problems), problems
 
 

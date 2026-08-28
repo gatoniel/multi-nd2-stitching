@@ -26,6 +26,7 @@ def test_position_optional_absent(cfg_dict, parse, field, expected):
         ("flip_y", False),
         ("overrides", []),
         ("overview", None),
+        ("stop_at", None),
     ],
 )
 def test_toplevel_optional_absent(cfg_dict, parse, field, expected):
@@ -38,11 +39,17 @@ def test_toplevel_optional_absent(cfg_dict, parse, field, expected):
     [
         ("shift_px", None),
         ("overview", None),
+        ("stop_at", None),
     ],
 )
 def test_toplevel_optional_explicit_null(cfg_dict, parse, field, expected):
     cfg_dict[field] = None
     assert getattr(parse(cfg_dict), field) == expected
+
+
+def test_stop_at_present(cfg_dict, parse):
+    cfg_dict["stop_at"] = 143
+    assert parse(cfg_dict).stop_at == 143
 
 
 # --- explicit YAML null must behave like absent -------------------------------
@@ -53,7 +60,9 @@ def test_position_explicit_null(cfg_dict, parse, field):
     assert getattr(parse(cfg_dict).positions["tile_b"], field) == []
 
 
-@pytest.mark.parametrize("field", ["drop", "anchor", "realign", "reason"])
+@pytest.mark.parametrize(
+    "field", ["drop", "anchor", "realign", "shaped_peak", "reason"]
+)
 def test_override_explicit_null(cfg_dict, parse, field):
     cfg_dict["overrides"] = [{"at": 5, "drop": ["tile_b"], field: None}]
     o = parse(cfg_dict).overrides[0]
@@ -118,6 +127,39 @@ def test_override_lookups(cfg_dict, parse):
     assert cfg.anchored_at(143) == {"tile_a"}
     assert cfg.dropped_at(4) == set()
     assert cfg.realigned_at(16) == {"tile_a"}
+
+
+# --- shaped_peak: tile-name and 'a,b' pair forms, side by side with the other
+# four verbs, none of which it should interfere with -----------------------
+def test_shaped_peak_at_holds_tile_names_and_pairs(cfg_dict, parse):
+    cfg_dict["overrides"] = [
+        {"at": 21, "shaped_peak": ["tile_a", "tile_a,tile_b"]},
+    ]
+    cfg = parse(cfg_dict)
+    assert cfg.shaped_peak_at(21) == {"tile_a", "tile_a,tile_b"}
+    assert cfg.shaped_peak_at(22) == set()
+
+
+def test_shaped_peak_is_not_part_of_names(cfg_dict, parse):
+    """It never changes graph membership -- unlike the other four verbs, it
+    must not show up in Override.names."""
+    cfg_dict["overrides"] = [{"at": 5, "shaped_peak": ["tile_a,tile_b"]}]
+    o = parse(cfg_dict).overrides[0]
+    assert o.names == set()
+
+
+def test_shaped_peak_coexists_with_other_verbs_in_one_block(cfg_dict, parse):
+    cfg_dict["overrides"] = [
+        {
+            "at": 5,
+            "drop": ["tile_b"],
+            "anchor": ["tile_a"],
+            "shaped_peak": ["tile_a"],
+        }
+    ]
+    cfg = parse(cfg_dict)
+    assert cfg.dropped_at(5) == {"tile_b"}
+    assert cfg.shaped_peak_at(5) == {"tile_a"}
 
 
 # --- slices -------------------------------------------------------------------

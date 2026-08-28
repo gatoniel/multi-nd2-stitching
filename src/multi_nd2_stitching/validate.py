@@ -111,8 +111,19 @@ def _check_overrides(cfg: StitchingConfig, p: list[str]) -> None:
         unknown = sorted(o.names - known)
         if unknown:
             p.append(f"{where}: unknown position(s) {unknown}")
-        if not o.names:
-            p.append(f"{where}: no drop/anchor/realign, block does nothing")
+        for entry in o.shaped_peak:
+            parts = entry.split(",")
+            if len(parts) not in (1, 2):
+                p.append(
+                    f"{where}.shaped_peak: '{entry}' must be a tile name or an "
+                    "'a,b' pair"
+                )
+                continue
+            bad = sorted(n for n in parts if n not in known)
+            if bad:
+                p.append(f"{where}.shaped_peak: unknown position(s) {bad} in '{entry}'")
+        if not (o.names or o.shaped_peak):
+            p.append(f"{where}: no drop/anchor/realign/shaped_peak, block does nothing")
         both = sorted(set(o.drop) & (set(o.anchor) | set(o.realign)))
         if both:
             p.append(f"{where}: {both} dropped and used in the same block")
@@ -145,13 +156,19 @@ def _check_timeline(cfg: StitchingConfig, nts, p: list[str]) -> None:
         p.append(f"timeline: got {len(nts)} file lengths for {cfg.n_files} files")
         return
     starts = [sum(nts[:i]) for i in range(cfg.n_files)]
-    nt = sum(nts)
+    raw_nt = sum(nts)
+    nt = raw_nt if cfg.stop_at is None else min(raw_nt, cfg.stop_at)
 
     for name, pos in cfg.positions.items():
         f0, t0 = pos.start
         if 0 <= f0 < cfg.n_files and t0 >= nts[f0]:
             p.append(
                 f"positions.{name}.start: timepoint {t0} beyond file {f0} (has {nts[f0]})"
+            )
+        elif 0 <= f0 < cfg.n_files and starts[f0] + t0 >= nt:
+            p.append(
+                f"positions.{name}.start: t={starts[f0] + t0} is at or beyond "
+                f"stop_at={cfg.stop_at}; this tile never appears"
             )
 
     for i, o in enumerate(cfg.overrides):
@@ -299,4 +316,34 @@ def check_layout(layout) -> list[str]:
             f"'{name}' becomes an anchor at t={_ranges(ts)} but is not alive at the "
             "previous timepoint, so it has no coordinate to drift from"
         )
+    return p
+
+
+def check_shaped_peak(layout) -> list[str]:
+    """A shaped_peak pair override must name a pair that is actually there.
+
+    'a,b' names an edge in the discovered neighbour graph, not two arbitrary
+    tile names -- config-tier validation can only check that both names are
+    known positions (`_check_overrides`), not whether they ever pair up or
+    are alive together at the timepoint given. If they aren't, there is no
+    PairTask for the override to attach to: `build_plan` simply never sets
+    `shaped_peak=True` anywhere, and the override silently does nothing.
+    """
+    p: list[str] = []
+    pair_index = {frozenset((pr.a, pr.b)): k for k, pr in enumerate(layout.pairs)}
+    for o in layout.config.overrides:
+        for entry in o.shaped_peak:
+            parts = entry.split(",")
+            if len(parts) != 2:
+                continue  # a bare tile name -- not this check's concern
+            k = pair_index.get(frozenset(parts))
+            if k is None:
+                p.append(f"shaped_peak: '{entry}' is not a discovered neighbour pair")
+                continue
+            dead = [t for t in o.at if not layout.pair_alive[t, k]]
+            if dead:
+                p.append(
+                    f"shaped_peak: '{entry}' is not alive at t={_ranges(dead)}; "
+                    "this override has nothing to attach to there"
+                )
     return p

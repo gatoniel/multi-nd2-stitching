@@ -73,18 +73,26 @@ class Override:
     neighbour graph, which then needs a fresh anchor at the same timepoint --
     those two edits are one decision and live in one block.
 
-    The four verbs:
-      drop      the tile is not there at all: no coordinate, no neighbour edges
-      unanchor  the tile stays and is still placed, but not by drifting from
-                t-1 -- it hangs off a neighbour instead
-      anchor    the tile is placed by drifting from t-1, in addition to
-                whatever reference_in_files says
-      realign   recompute this tile's drift step using realignment_slices
+    The five verbs:
+      drop         the tile is not there at all: no coordinate, no neighbour edges
+      unanchor     the tile stays and is still placed, but not by drifting from
+                   t-1 -- it hangs off a neighbour instead
+      anchor       the tile is placed by drifting from t-1, in addition to
+                   whatever reference_in_files says
+      realign      recompute this tile's drift step using realignment_slices
+      shaped_peak  pick the correlation peak by shape instead of raw height --
+                   see StitchingConfig.shaped_peak_at
 
     `unanchor` is what you want when a tile should keep its place in the mosaic
     while some *other* tile carries the drift across a timepoint. Two anchors in
     one connected component over-determine it, so handing over means unanchoring
     one as you anchor the other.
+
+    `shaped_peak` entries name either a bare tile name (a drift step) or an
+    `"a,b"` pair (a neighbour correlation, the same convention `stitch inspect
+    --pair` uses) -- unlike the other four verbs, it never changes which tiles
+    exist or how they're connected, only how one correlation's peak is picked,
+    so it is deliberately not part of `names`.
     """
 
     at: Timepoints
@@ -93,6 +101,7 @@ class Override:
     unanchor: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
     anchor: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
     realign: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
+    shaped_peak: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
 
     @property
     def names(self) -> set[str]:
@@ -130,6 +139,11 @@ class StitchingConfig:
     slices: Slices3D = attrs.field(factory=_empty_slices)
     realignment_slices: Slices3D = attrs.field(factory=_empty_slices)
     overview: Overview | None = None
+    # The global timeline ends here, EXCLUSIVE (same convention as
+    # Position.end) -- timepoints from stop_at on are simply not part of the
+    # run, as if the files were shorter. For the tail after an experiment
+    # ends but imaging continues; unset, the whole timeline is used.
+    stop_at: int | None = None
 
     @property
     def n_files(self) -> int:
@@ -149,6 +163,10 @@ class StitchingConfig:
 
     def realigned_at(self, t: int) -> set[str]:
         return {n for o in self.overrides if t in o.at for n in o.realign}
+
+    def shaped_peak_at(self, t: int) -> set[str]:
+        """Tile names and/or 'a,b' pair strings, whichever this override names."""
+        return {n for o in self.overrides if t in o.at for n in o.shaped_peak}
 
 
 def loads_config(text: str) -> StitchingConfig:

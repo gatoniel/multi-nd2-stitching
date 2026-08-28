@@ -80,6 +80,10 @@ def test_detects_problem(cfg_dict, parse, mutate, fragment):
         ({"at": 0, "realign": ["tile_a"]}, "no predecessor"),
         # the coupling this schema exists to surface
         ({"at": 143, "drop": ["tile_a"]}, "without naming a replacement"),
+        # shaped_peak
+        ({"at": 5, "shaped_peak": ["nope"]}, "unknown position"),
+        ({"at": 5, "shaped_peak": ["tile_a,nope"]}, "unknown position"),
+        ({"at": 5, "shaped_peak": ["a,b,c"]}, "tile name or an 'a,b' pair"),
     ],
 )
 def test_detects_override_problem(cfg_dict, parse, override, fragment):
@@ -90,6 +94,17 @@ def test_detects_override_problem(cfg_dict, parse, override, fragment):
 
 def test_dropping_a_reference_with_an_anchor_is_fine(cfg_dict, parse):
     cfg_dict["overrides"] = [{"at": 143, "drop": ["tile_a"], "anchor": ["tile_b"]}]
+    assert check(parse(cfg_dict)) == []
+
+
+# --- shaped_peak ----------------------------------------------------------------
+def test_shaped_peak_only_block_is_not_a_no_op(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 5, "shaped_peak": ["tile_a,tile_b"]}]
+    assert check(parse(cfg_dict)) == []
+
+
+def test_shaped_peak_tile_name_form_is_fine(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 5, "shaped_peak": ["tile_a"]}]
     assert check(parse(cfg_dict)) == []
 
 
@@ -118,6 +133,43 @@ def test_timeline_catches_start_beyond_file(cfg_dict, parse):
     cfg_dict["positions"]["tile_b"] = {"start": [0, 50]}
     problems = check(parse(cfg_dict), nts=[10, 10])
     assert any("beyond file 0" in p for p in problems), problems
+
+
+# --- stop_at --------------------------------------------------------------------
+def test_stop_at_flags_an_override_past_it(cfg_dict, parse):
+    cfg_dict["stop_at"] = 5
+    cfg_dict["overrides"] = [{"at": 5, "drop": ["tile_b"]}]
+    problems = check(parse(cfg_dict), nts=[10, 10])
+    assert any("beyond timeline (nt=5)" in p for p in problems), problems
+
+
+def test_stop_at_allows_an_override_within_it(cfg_dict, parse):
+    cfg_dict["stop_at"] = 5
+    cfg_dict["overrides"] = [{"at": 4, "drop": ["tile_b"]}]
+    assert check(parse(cfg_dict), nts=[10, 10]) == []
+
+
+def test_stop_at_flags_a_tile_that_never_appears(cfg_dict, parse):
+    cfg_dict["stop_at"] = 3
+    cfg_dict["positions"]["tile_b"] = {"start": [1, 0]}  # global t=10
+    problems = check(parse(cfg_dict), nts=[10, 10])
+    assert any("never appears" in p for p in problems), problems
+
+
+def test_stop_at_unset_never_flags_never_appears(cfg_dict, parse):
+    cfg_dict["positions"]["tile_b"] = {"start": [1, 0]}
+    problems = check(parse(cfg_dict), nts=[10, 10])
+    assert not any("never appears" in p for p in problems), problems
+
+
+def test_stop_at_does_not_relieve_a_file_of_needing_a_reference(cfg_dict, parse):
+    """Deliberate scope boundary: a file entirely past stop_at still needs a
+    reference in cfg.files -- stop_at truncates the timeline, not the file
+    list; trim `files:` itself if a trailing file is not wanted at all."""
+    cfg_dict["files"] = ["a.nd2", "b.nd2", "c.nd2"]
+    cfg_dict["stop_at"] = 5  # entirely within file 0 (nts=[10, 10, 10])
+    problems = check(parse(cfg_dict), nts=[10, 10, 10])
+    assert any("have no reference position" in p for p in problems), problems
 
 
 def test_timeline_catches_override_on_dead_tile(cfg_dict, parse):

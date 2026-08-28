@@ -3,6 +3,7 @@ import pytest
 import scipy.fft as spfft
 from helpers import FakeReader
 
+from multi_nd2_stitching import compute as C
 from multi_nd2_stitching.compute import (
     Spectra,
     crop_for_alignment,
@@ -46,6 +47,183 @@ def test_survives_a_zeroed_spectrum_bin(recwarn):
     result = tuple(phase_corr_from_ffts(fft0, fft1, a.shape))
 
     assert result == tuple(-s for s in shift)
+    assert not [w for w in recwarn.list if issubclass(w.category, RuntimeWarning)]
+
+
+# --- shaped_peak: reject artifact peaks by shape, not raw height --------------
+def test_neighbour_decay_isotropic_bump_scores_positive_in_every_axis():
+    arr = np.zeros((8, 8, 8))
+    arr[4, 4, 4] = 5.0
+    arr[3, 4, 4] = arr[5, 4, 4] = 3.0
+    arr[4, 3, 4] = arr[4, 5, 4] = 3.0
+    arr[4, 4, 3] = arr[4, 4, 5] = 3.0
+    assert C._neighbour_decay(arr, (4, 4, 4)) == pytest.approx(2.0)
+
+
+def test_neighbour_decay_line_artifact_scores_zero():
+    """Bright the whole length of the z axis at one (y, x) -- a stuck-column-
+    style defect. It doesn't decay along its own axis at all."""
+    arr = np.zeros((8, 8, 8))
+    arr[:, 4, 4] = 10.0
+    assert C._neighbour_decay(arr, (4, 4, 4)) == pytest.approx(0.0)
+
+
+def test_neighbour_decay_wraps_around():
+    """The response is a circular correlation surface -- index 0's neighbour
+    on one side is index -1, not out of bounds."""
+    arr = np.zeros((8, 8, 8))
+    arr[0, 4, 4] = 5.0
+    arr[7, 4, 4] = arr[1, 4, 4] = 3.0  # the wrapped z-neighbours of index 0
+    assert C._neighbour_decay(arr, (0, 4, 4)) == pytest.approx(2.0)
+
+
+def test_neighbour_decay_uses_the_brighter_neighbour_not_the_average():
+    """A point at the edge of a streak (background on one side, more streak
+    on the other) must not look decayed just because the average of a bright
+    and a dark neighbour happens to be low -- the streak side alone should
+    count."""
+    arr = np.zeros((8, 8, 8))
+    arr[1:4, 2, 2] = 8.0  # a 3-long ridge
+    # (1, 2, 2) is the ridge's edge: z-neighbours are 0 (background) and 8.0
+    # (more ridge). The *average* would suggest some z-decay; it must not.
+    assert C._neighbour_decay(arr, (1, 2, 2)) == pytest.approx(0.0)
+
+
+def test_shaped_peak_index_prefers_the_isotropic_bump_over_a_taller_ridge():
+    """The scenario the override exists for: an artifact taller than the real
+    peak, but shaped like a streak rather than a point."""
+    arr = np.zeros((8, 8, 8))
+    arr[1:4, 2, 2] = 8.0  # taller than the real peak, but a flat ridge
+    arr[5, 5, 5] = 6.0  # the real, isotropically-decaying peak
+    arr[4, 5, 5] = arr[6, 5, 5] = 4.0
+    arr[5, 4, 5] = arr[5, 6, 5] = 4.0
+    arr[5, 5, 4] = arr[5, 5, 6] = 4.0
+
+    # Sanity: naive argmax lands on the ridge, not the real peak.
+    assert np.unravel_index(np.argmax(arr), arr.shape) in {
+        (1, 2, 2),
+        (2, 2, 2),
+        (3, 2, 2),
+    }
+    assert C._shaped_peak_index(arr, candidates=5) == (5, 5, 5)
+
+
+def test_shaped_peak_index_with_no_artifact_still_finds_the_true_peak():
+    arr = np.zeros((8, 8, 8))
+    arr[4, 4, 4] = 5.0
+    arr[3, 4, 4] = arr[5, 4, 4] = 3.0
+    arr[4, 3, 4] = arr[4, 5, 4] = 3.0
+    arr[4, 4, 3] = arr[4, 4, 5] = 3.0
+    assert C._shaped_peak_index(arr) == (4, 4, 4)
+
+
+def test_phase_corr_from_ffts_shaped_mode_still_recovers_a_clean_translation():
+    """No artifact present: shaped mode must agree with the default path."""
+    a = vol()
+    shift = (1, -2, 3)
+    b = np.roll(a, shift, axis=(0, 1, 2))
+    fft0, fft1 = spfft.rfftn(a), spfft.rfftn(b)
+    plain = tuple(phase_corr_from_ffts(fft0, fft1, a.shape, shaped=False))
+    shaped = tuple(phase_corr_from_ffts(fft0, fft1, a.shape, shaped=True))
+    assert plain == shaped == tuple(-s for s in shift)
+
+
+def test_phase_corr_from_ffts_shaped_true_uses_the_shaped_index(monkeypatch):
+    """Wiring check: shaped=True actually calls the shaped selector, and its
+    result goes through the same wrap-to-signed-shift arithmetic as argmax."""
+    calls = []
+
+    def fake_shaped_peak_index(inverse, candidates=C.SHAPED_PEAK_CANDIDATES):
+        calls.append(inverse.shape)
+        return (0, 0, 0)
+
+    monkeypatch.setattr(C, "_shaped_peak_index", fake_shaped_peak_index)
+    a = vol()
+    fft0, fft1 = spfft.rfftn(a), spfft.rfftn(a)
+    result = tuple(phase_corr_from_ffts(fft0, fft1, a.shape, shaped=True))
+    assert result == (0, 0, 0)
+    assert calls == [a.shape]
+
+
+# --- candidate_peaks / axis_profile: the data stitch inspect exports ----------
+def test_candidate_peaks_returns_the_requested_count_sorted_by_value():
+    arr = np.zeros((8, 8, 8))
+    arr[4, 4, 4] = 5.0
+    arr[1, 1, 1] = 4.0
+    arr[2, 2, 2] = 3.0
+    arr[3, 3, 3] = 2.0
+    arr[6, 6, 6] = 1.0
+    cands = C.candidate_peaks(arr, candidates=3)
+    assert len(cands) == 3
+    assert [c.value for c in cands] == [5.0, 4.0, 3.0]
+    assert cands[0].index == (4, 4, 4)
+
+
+def test_candidate_peaks_decay_matches_neighbour_decay():
+    arr = np.zeros((8, 8, 8))
+    arr[4, 4, 4] = 5.0
+    arr[3, 4, 4] = arr[5, 4, 4] = 3.0
+    arr[4, 3, 4] = arr[4, 5, 4] = 3.0
+    arr[4, 4, 3] = arr[4, 4, 5] = 3.0
+    cands = C.candidate_peaks(arr, candidates=1)
+    assert cands[0].decay == pytest.approx(C._neighbour_decay(arr, (4, 4, 4)))
+
+
+def test_shaped_peak_index_agrees_with_max_decay_candidate():
+    """A refactor, not a behaviour change: _shaped_peak_index is exactly
+    max(candidate_peaks(...), key=decay)."""
+    arr = np.zeros((8, 8, 8))
+    arr[1:4, 2, 2] = 8.0
+    arr[5, 5, 5] = 6.0
+    arr[4, 5, 5] = arr[6, 5, 5] = 4.0
+    arr[5, 4, 5] = arr[5, 6, 5] = 4.0
+    arr[5, 5, 4] = arr[5, 5, 6] = 4.0
+    best = max(C.candidate_peaks(arr, candidates=5), key=lambda c: c.decay)
+    assert C._shaped_peak_index(arr, candidates=5) == best.index
+
+
+def test_axis_profile_length_and_centre():
+    arr = np.zeros((8, 8, 8))
+    arr[4, 4, 4] = 5.0
+    profile = C.axis_profile(arr, (4, 4, 4), axis=0, radius=3)
+    assert len(profile) == 7  # 2*radius + 1
+    assert profile[3] == 5.0  # the centre step (0)
+
+
+def test_axis_profile_wraps_around():
+    arr = np.zeros((8, 8, 8))
+    arr[0, 4, 4] = 5.0
+    arr[7, 4, 4] = 2.0  # wrapped neighbour "before" index 0
+    profile = C.axis_profile(arr, (0, 4, 4), axis=0, radius=1)
+    assert list(profile) == [2.0, 5.0, 0.0]  # step -1, 0, +1
+
+
+def test_axis_profile_only_moves_along_the_requested_axis():
+    arr = np.zeros((8, 8, 8))
+    arr[4, 4, 4] = 5.0
+    arr[4, 4, 5] = 9.0  # x-neighbour; must not leak into the z profile
+    profile = C.axis_profile(arr, (4, 4, 4), axis=0, radius=1)
+    assert list(profile) == [0.0, 5.0, 0.0]
+
+
+# --- correlation_surface: the shared, zero-bin-safe response ------------------
+def test_correlation_surface_matches_phase_corr_peak():
+    a = vol()
+    shift = (0, 3, -2)
+    b = np.roll(a, shift, axis=(0, 1, 2))
+    fft0, fft1 = spfft.rfftn(a), spfft.rfftn(b)
+    surface = C.correlation_surface(fft0, fft1, a.shape)
+    idx = np.unravel_index(np.argmax(surface), a.shape)
+    assert tuple(C.to_signed_shift(idx, a.shape)) == tuple(-s for s in shift)
+
+
+def test_correlation_surface_survives_a_zeroed_bin(recwarn):
+    """The zero-bin fix lives here now; phase_corr_from_ffts is just a caller."""
+    a = vol()
+    fft0, fft1 = spfft.rfftn(a), spfft.rfftn(a)
+    fft0[1, 2, 3] = 0
+    surface = C.correlation_surface(fft0, fft1, a.shape)
+    assert np.all(np.isfinite(surface))
     assert not [w for w in recwarn.list if issubclass(w.category, RuntimeWarning)]
 
 

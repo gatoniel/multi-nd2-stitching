@@ -98,13 +98,21 @@ class TimeTask:
     crop: Crop
     precision: str = "float32"
     realign: bool = False
+    shaped_peak: bool = False
 
     kind = "time"
 
     @property
     def key(self) -> str:
         return _digest(
-            ["time", self.src.key(), self.dst.key(), self.crop.key(), self.precision]
+            [
+                "time",
+                self.src.key(),
+                self.dst.key(),
+                self.crop.key(),
+                self.precision,
+                self.shaped_peak,
+            ]
         )
 
     def spectrum_refs(self) -> tuple[SpectrumRef, SpectrumRef]:
@@ -115,6 +123,7 @@ class TimeTask:
 
     def describe(self) -> str:
         tag = " (realign)" if self.realign else ""
+        tag += " (shaped)" if self.shaped_peak else ""
         return f"time {self.name} {self.t_from}->{self.t_to}{tag}"
 
 
@@ -131,6 +140,7 @@ class PairTask:
     crop: Crop
     shift_px: int
     precision: str = "float32"
+    shaped_peak: bool = False
 
     kind = "pair"
 
@@ -145,6 +155,7 @@ class PairTask:
                 self.shift_px,
                 self.crop.key(),
                 self.precision,
+                self.shaped_peak,
             ]
         )
 
@@ -159,7 +170,8 @@ class PairTask:
         )
 
     def describe(self) -> str:
-        return f"pair {self.a}|{self.b} axis={self.axis} t={self.t}"
+        tag = " (shaped)" if self.shaped_peak else ""
+        return f"pair {self.a}|{self.b} axis={self.axis} t={self.t}{tag}"
 
 
 @attrs.frozen
@@ -272,11 +284,13 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                     crop=realign_crop if realign else crop,
                     precision=precision,
                     realign=realign,
+                    shaped_peak=name in cfg.shaped_peak_at(t),
                 )
             )
 
     pair_tasks = []
     for t in range(layout.nt):
+        shaped_at_t = cfg.shaped_peak_at(t)
         for p in layout.pairs_at(t):
             pair_tasks.append(
                 PairTask(
@@ -289,6 +303,9 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                     crop=crop.free_axis(p.axis),
                     shift_px=layout.shift_px,
                     precision=precision,
+                    shaped_peak=(
+                        f"{p.a},{p.b}" in shaped_at_t or f"{p.b},{p.a}" in shaped_at_t
+                    ),
                 )
             )
 
