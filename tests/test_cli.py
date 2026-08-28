@@ -1,5 +1,9 @@
 """End-to-end CLI tests with a stubbed ND2 layer."""
 
+import sys
+import types
+
+import numpy as np
 import pytest
 import yaml
 from helpers import FakeReader, make_meta
@@ -7,6 +11,7 @@ from helpers import FakeReader, make_meta
 from multi_nd2_stitching import cli
 from multi_nd2_stitching import metadata as M
 from multi_nd2_stitching import reader as R
+from multi_nd2_stitching.metadata import read_metadata as _real_read_metadata
 from multi_nd2_stitching.workspace import Workspace
 
 CFG = {
@@ -854,3 +859,202 @@ def test_full_blend_is_unaffected(project, capsys):
     capsys.readouterr()
     run("blend", project, "--no-progress")
     assert "skeleton" not in capsys.readouterr().out
+
+
+# --- times ----------------------------------------------------------------------
+def test_times_writes_a_csv_by_default(project):
+    run("times", project)
+    ws = Workspace.of(project)
+    assert (ws.root / "times.csv").exists()
+
+
+def test_times_respects_format_and_out(project, tmp_path):
+    out = tmp_path / "custom.npy"
+    run("times", project, "--format", "npy", "--out", out)
+    assert out.exists()
+
+
+# --- overview ---------------------------------------------------------------------
+class _FakeChannel:
+    def __init__(self, jdn):
+        self.time = types.SimpleNamespace(absoluteJulianDayNumber=jdn)
+
+
+class _FakeFrameMeta:
+    def __init__(self, jdn):
+        self.channels = [_FakeChannel(jdn)]
+
+
+class _FakePoint:
+    def __init__(self, name, x, y):
+        self.name = name
+        self.stagePositionUm = types.SimpleNamespace(x=x, y=y)
+
+
+class _FakeND2File:
+    """Enough of nd2.ND2File for read_metadata + overview.read_overview_plane."""
+
+    def __init__(self, path, points, sizes, frame, voxel_x=1.0):
+        self.path = path
+        self._points = points
+        self._sizes = sizes
+        self._frame = frame
+        self._voxel_x = voxel_x
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    @property
+    def experiment(self):
+        params = types.SimpleNamespace(points=self._points)
+        return [None, types.SimpleNamespace(parameters=params)]
+
+    @property
+    def sizes(self):
+        return dict(self._sizes)
+
+    def voxel_size(self):
+        return types.SimpleNamespace(x=self._voxel_x)
+
+    @property
+    def loop_indices(self):
+        return ({"P": 0},)
+
+    @property
+    def components_per_channel(self):
+        return 1
+
+    def frame_metadata(self, seq):
+        return _FakeFrameMeta(2440587.5)
+
+    def read_frame(self, seq):
+        return self._frame
+
+
+@pytest.fixture
+def overview_project(project, monkeypatch, tmp_path):
+    """`project` plus a fake overview.nd2 that the real overview code opens.
+
+    `metadata.read_metadata` and `overview.read_overview_plane` both do their
+    own `import nd2` locally, so this stubs `sys.modules["nd2"]` rather than
+    those functions -- the real code under test runs unmodified against it.
+    """
+    overview_path = tmp_path / "overview.nd2"
+    overview_path.write_bytes(b"o" * 30)
+    frame = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+
+    fake_module = types.ModuleType("nd2")
+    fake_module.ND2File = lambda path: _FakeND2File(
+        str(path),
+        points=[_FakePoint("wide1", 0.0, 0.0)],
+        sizes={"Y": 64, "X": 64},
+        frame=frame,
+    )
+    monkeypatch.setitem(sys.modules, "nd2", fake_module)
+
+    def dispatch(paths):
+        paths = list(paths)
+        if paths == [str(overview_path)]:
+            # The true original, captured at import time -- `project` (which
+            # this fixture depends on) has already replaced M.read_metadata
+            # by the time this fixture body runs, so `M.read_metadata` itself
+            # is no longer the real function here.
+            return _real_read_metadata(paths)
+        return make_meta(n_files=len(paths), nt=4, nz=4, ny=8, nx=8, paths=paths)
+
+    monkeypatch.setattr(M, "read_metadata", dispatch)
+
+    cfg = yaml.safe_load(project.read_text())
+    cfg["overview"] = {"file": str(overview_path), "channel": "wide1"}
+    project.write_text(yaml.safe_dump(cfg))
+    return project, overview_path
+
+
+def test_overview_writes_a_png(overview_project):
+    project, _overview_path = overview_project
+    assert run("overview", project) == 0
+    ws = Workspace.of(project)
+    out = ws.root / "overview.png"
+    assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_overview_respects_out(overview_project, tmp_path):
+    project, _overview_path = overview_project
+    out = tmp_path / "custom.png"
+    assert run("overview", project, "--out", out) == 0
+    assert out.exists()
+
+
+def test_overview_cli_channel_overrides_the_config(overview_project, tmp_path):
+    """--channel wins even when the config names a different (bad) one."""
+    project, _overview_path = overview_project
+    cfg = yaml.safe_load(project.read_text())
+    cfg["overview"]["channel"] = "not-a-real-position"
+    project.write_text(yaml.safe_dump(cfg))
+    out = tmp_path / "by_channel.png"
+    assert run("overview", project, "--channel", "wide1", "--out", out) == 0
+    assert out.exists()
+
+
+def test_overview_unknown_channel_is_reported_and_writes_nothing(
+    overview_project, capsys
+):
+    project, _overview_path = overview_project
+    cfg = yaml.safe_load(project.read_text())
+    cfg["overview"]["channel"] = "nope"
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("overview", project) == 1
+    assert "not a position" in capsys.readouterr().err
+    ws = Workspace.of(project)
+    assert not (ws.root / "overview.png").exists()
+
+
+def test_overview_without_a_channel_or_file_is_reported(project, capsys):
+    assert run("overview", project) == 1
+    assert "need a file and a channel" in capsys.readouterr().err
+
+
+def test_overview_shrinks_a_large_plane(overview_project, capsys):
+    """A plane above --max-size is downsampled, and it says so."""
+    project, _overview_path = overview_project
+    capsys.readouterr()
+    assert run("overview", project, "--max-size", "16") == 0
+    assert "shrunk" in capsys.readouterr().out
+
+
+def test_overview_reports_the_resolved_output_path(overview_project, capsys):
+    project, _overview_path = overview_project
+    capsys.readouterr()
+    assert run("overview", project) == 0
+    out = capsys.readouterr().out
+    ws = Workspace.of(project)
+    assert str(ws.root / "overview.png") in out
+
+
+def test_overview_skips_non_finite_markers_and_warns(
+    overview_project, capsys, monkeypatch
+):
+    """A zero voxel size (a broken/uncalibrated overview file) divides by
+    zero in the stage-to-pixel math -- that must be skipped and reported,
+    not left to crash deep inside PIL with a NaN coordinate."""
+    project, _overview_path = overview_project
+    frame = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    fake_module = types.ModuleType("nd2")
+    fake_module.ND2File = lambda path: _FakeND2File(
+        str(path),
+        points=[_FakePoint("wide1", 0.0, 0.0)],
+        sizes={"Y": 64, "X": 64},
+        frame=frame,
+        voxel_x=0.0,
+    )
+    monkeypatch.setitem(sys.modules, "nd2", fake_module)
+
+    assert run("overview", project) == 0
+    err = capsys.readouterr().err
+    assert "non-finite position" in err
+    ws = Workspace.of(project)
+    assert (ws.root / "overview.png").exists()

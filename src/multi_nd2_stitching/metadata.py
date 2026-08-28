@@ -131,7 +131,7 @@ def read_metadata(paths) -> Metadata:
                 FileMeta(
                     path=str(path),
                     nt=nt,
-                    nz=f.sizes["Z"],
+                    nz=f.sizes.get("Z", 1),
                     ny=f.sizes["Y"],
                     nx=f.sizes["X"],
                     position_names=tuple(p.name for p in points),

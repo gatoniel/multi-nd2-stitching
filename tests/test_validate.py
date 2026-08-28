@@ -241,3 +241,10 @@ def test_overview_missing_file_is_flagged_only_with_check_files(cfg_dict, parse)
     assert check(parse(cfg_dict)) == []
     problems = check(parse(cfg_dict), check_files=True)
     assert any("overview.file" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("field", ["z", "t"])
+def test_overview_negative_z_or_t_is_flagged(cfg_dict, parse, field):
+    cfg_dict["overview"] = {"file": "overview.nd2", "channel": "pos1", field: -1}
+    problems = check(parse(cfg_dict))
+    assert any(f"overview.{field}" in p for p in problems), problems

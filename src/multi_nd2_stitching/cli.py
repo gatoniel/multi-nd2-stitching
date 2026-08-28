@@ -521,9 +521,26 @@ def cmd_times(args) -> int:
     return 0
 
 
+def _peak_rss_mb() -> str:
+    """Peak resident memory of this process so far, formatted for a log line.
+
+    The `resource` module is POSIX-only; this is diagnostic output, not a
+    control-flow value, so "n/a" on a platform without it is fine.
+    """
+    try:
+        import resource
+    except ImportError:
+        return "n/a"
+    kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KiB on Linux
+    return f"{kb / 1024:.0f} MB"
+
+
 def cmd_overview(args) -> int:
+    import math
+
     from .metadata import read_metadata
     from .overview import (
+        downsample_plane,
         marker_positions,
         normalize_to_uint8,
         read_overview_plane,
@@ -534,6 +551,8 @@ def cmd_overview(args) -> int:
 
     overview_file = args.overview_file or (cfg.overview and cfg.overview.file)
     channel = args.channel or (cfg.overview and cfg.overview.channel)
+    z = args.z if args.z is not None else (cfg.overview.z if cfg.overview else 0)
+    t = args.t if args.t is not None else (cfg.overview.t if cfg.overview else 0)
     label = cfg.overview.label if cfg.overview else True
     if not overview_file or not channel:
         print(
@@ -542,6 +561,21 @@ def cmd_overview(args) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # Resolved and confirmed writable *before* any expensive work, so a
+    # question about the output path never depends on how far the rest of
+    # the command got.
+    out = (args.out or (ws.root / "overview.png")).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    probe = out.parent / f".overview-write-check-{id(args)}"
+    try:
+        probe.write_bytes(b"")
+    except OSError as e:
+        print(f"overview: cannot write to {out.parent}: {e}", file=sys.stderr)
+        return 1
+    finally:
+        probe.unlink(missing_ok=True)
+    print(f"overview   writing to {out}", flush=True)
 
     overview_meta = read_metadata([overview_file])[0]
     idx = overview_meta.position_of((channel,))
@@ -552,15 +586,46 @@ def cmd_overview(args) -> int:
             file=sys.stderr,
         )
         return 1
+    if overview_meta.nz > 1 or overview_meta.nt > 1:
+        print(
+            f"overview   file has z={overview_meta.nz}, t={overview_meta.nt}; "
+            f"using z={z}, t={t} (set overview.z/overview.t in the config to change)",
+            flush=True,
+        )
 
     markers = marker_positions(cfg, meta, overview_meta, channel)
-    plane = read_overview_plane(overview_file, idx)
-    image = normalize_to_uint8(plane)
+    bad = {n: p for n, p in markers.items() if not all(math.isfinite(v) for v in p)}
+    if bad:
+        print(
+            f"overview   {len(bad)} marker(s) have a non-finite position "
+            f"(e.g. {next(iter(bad))}={bad[next(iter(bad))]}) and will be skipped -- "
+            "check overview.file's voxel size / stage units",
+            file=sys.stderr,
+        )
+        markers = {n: p for n, p in markers.items() if n not in bad}
 
-    out = args.out or (ws.root / "overview.png")
+    plane = read_overview_plane(overview_file, idx, z=z, t=t)
+    print(
+        f"overview   read plane {tuple(plane.shape)} {plane.dtype}  "
+        f"(peak {_peak_rss_mb()})",
+        flush=True,
+    )
+    plane, scale = downsample_plane(plane, max_dim=args.max_size)
+    if scale != 1.0:
+        markers = {
+            name: (row * scale, col * scale) for name, (row, col) in markers.items()
+        }
+        print(f"overview   shrunk {1 / scale:.1f}x to keep the PNG small", flush=True)
+    image = normalize_to_uint8(plane)
+    print(
+        f"overview   {len(markers)} marker(s), about to render and save  "
+        f"(peak {_peak_rss_mb()})",
+        flush=True,
+    )
+
     render_overview(image, markers, out, label=label)
-    print(f"wrote      {out}")
-    print(f"markers    {len(markers)} tile(s) at position '{channel}'")
+    print(f"wrote      {out}  (peak {_peak_rss_mb()})", flush=True)
+    print(f"markers    {len(markers)} tile(s) at position '{channel}'", flush=True)
     return 0
 
 
@@ -873,7 +938,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--channel", help="XY position name in overview.nd2; overrides overview.channel"
     )
     ov.add_argument("--overview-file", type=Path, help="overrides overview.file")
+    ov.add_argument(
+        "--z",
+        type=int,
+        help="z-slice to render, if the file has more than one; overrides "
+        "overview.z (default 0)",
+    )
+    ov.add_argument(
+        "--t",
+        type=int,
+        help="timepoint to render, if the file has more than one; overrides "
+        "overview.t (default 0)",
+    )
     ov.add_argument("--out", type=Path, help="defaults to <workspace>/overview.png")
+    ov.add_argument(
+        "--max-size",
+        type=int,
+        default=2000,
+        help="shrink the longer side to at most this many pixels before "
+        "writing the PNG; a full-resolution overview scan can be gigabytes "
+        "of intermediate memory otherwise (default 2000)",
+    )
     ov.set_defaults(func=cmd_overview)
     return ap
 

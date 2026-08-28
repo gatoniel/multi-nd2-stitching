@@ -108,10 +108,16 @@ class Overview:
     `channel` names an entry in overview.nd2's own multipoint experiment --
     the same lookup `FileMeta.position_of` does for the tile files -- not a
     fluorescence channel.
+
+    Overview scans are usually a single 2D plane: no Z stack, no timelapse.
+    `z`/`t` only matter when the file actually has more than one of either --
+    they pick which slice/timepoint becomes the PNG, and default to the first.
     """
 
     file: str
     channel: str
+    z: int = 0
+    t: int = 0
     label: bool = True
 
 

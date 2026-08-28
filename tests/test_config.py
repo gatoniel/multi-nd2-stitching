@@ -161,6 +161,15 @@ def test_overview_present(cfg_dict, parse):
     assert ov.file == "overview.nd2"
     assert ov.channel == "pos1"
     assert ov.label is True
+    assert ov.z == 0
+    assert ov.t == 0
+
+
+def test_overview_z_and_t_are_configurable(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "o.nd2", "channel": "p1", "z": 3, "t": 12}
+    ov = parse(cfg_dict).overview
+    assert ov.z == 3
+    assert ov.t == 12
 
 
 def test_overview_label_can_be_disabled(cfg_dict, parse):

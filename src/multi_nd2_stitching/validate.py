@@ -183,6 +183,10 @@ def _check_overview(cfg: StitchingConfig, p: list[str], check_files: bool) -> No
         p.append(f"overview.file: {ov.file} does not exist")
     if not ov.channel:
         p.append("overview.channel: empty")
+    if ov.z < 0:
+        p.append(f"overview.z: negative ({ov.z})")
+    if ov.t < 0:
+        p.append(f"overview.t: negative ({ov.t})")
 
 
 def check(cfg: StitchingConfig, nts=None, check_files: bool = False) -> list[str]:
