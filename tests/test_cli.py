@@ -144,6 +144,13 @@ def test_status_respects_between(project, capsys):
     assert "pending 3" in capsys.readouterr().out
 
 
+def test_status_reports_corner_count(project, capsys):
+    """A line, not a grid -- no diagonal neighbours, so 0 is the right count,
+    but the field itself must be there."""
+    run("status", project)
+    assert "corners 0" in capsys.readouterr().out
+
+
 # --- offsets: the run, and the second run -------------------------------------
 def test_dry_run_computes_nothing(project, capsys):
     assert run("offsets", project, "--dry-run") == 0

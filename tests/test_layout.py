@@ -1,11 +1,30 @@
 import numpy as np
 import pytest
 import yaml
-from helpers import build, make_meta
+from helpers import build, grid_meta, make_meta, stub_files
 
 from multi_nd2_stitching.config import loads_config
 from multi_nd2_stitching.layout import build_layout
 from multi_nd2_stitching.validate import check_layout, check_shaped_peak
+
+# A 2x2 grid, one step = 55um, same spacing test_placement.py's SQUARE uses.
+SQUARE = {"a": (0.0, 0.0), "b": (55.0, 0.0), "c": (0.0, 55.0), "d": (55.0, 55.0)}
+# The gap case this all exists for: b and c are diagonal, but nothing sits at
+# the (55, 55) corner to "complete the square" via two edge Pairs instead.
+ELL = {"a": (0.0, 0.0), "b": (55.0, 0.0), "c": (0.0, 55.0)}
+
+
+def _grid(tmp_path, coords, nt=3):
+    files = stub_files(tmp_path, 2)
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "positions": {n: {"start": [0, 0]} for n in coords},
+    }
+    return build_layout(
+        loads_config(yaml.safe_dump(cfg)), grid_meta(coords, files, nt=nt)
+    )
 
 
 # --- timeline -----------------------------------------------------------------
@@ -157,6 +176,55 @@ def test_flip_x_reverses_only_x_pairs(cfg_dict):
 
 def test_pairs_are_deterministic(cfg_dict):
     assert build(cfg_dict).pairs == build(cfg_dict).pairs
+
+
+# --- corner discovery -----------------------------------------------------------
+def test_corners_found_diagonally(tmp_path):
+    lay = _grid(tmp_path, SQUARE)
+    assert {(c.a, c.b) for c in lay.corners} == {("a", "d"), ("b", "c")}
+
+
+def test_edge_neighbours_are_not_also_corners(tmp_path):
+    lay = _grid(tmp_path, SQUARE)
+    edges = {(p.a, p.b) for p in lay.pairs} | {(p.b, p.a) for p in lay.pairs}
+    corners = {(c.a, c.b) for c in lay.corners} | {(c.b, c.a) for c in lay.corners}
+    assert edges.isdisjoint(corners)
+
+
+def test_no_corners_in_a_line(cfg_dict):
+    """make_meta only lays tiles out in a line -- nothing is ever diagonal."""
+    assert build(cfg_dict).corners == ()
+
+
+def test_corner_survives_a_missing_third_tile(tmp_path):
+    """The whole point: b and c are diagonal even though nothing occupies the
+    (55, 55) corner to connect them via two edge Pairs instead."""
+    lay = _grid(tmp_path, ELL)
+    assert {(c.a, c.b) for c in lay.corners} == {("b", "c")}
+
+
+def test_corners_are_deterministic(tmp_path):
+    assert _grid(tmp_path, SQUARE).corners == _grid(tmp_path, SQUARE).corners
+
+
+def test_corner_alive_tracks_both_tiles(tmp_path):
+    lay = _grid(tmp_path, ELL, nt=3)
+    k = next(k for k, c in enumerate(lay.corners) if {c.a, c.b} == {"b", "c"})
+    assert lay.corner_alive[:, k].all()
+
+
+def test_dropping_either_tile_kills_the_corner(tmp_path):
+    files = stub_files(tmp_path, 2)
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "positions": {n: {"start": [0, 0]} for n in ELL},
+        "overrides": [{"at": 1, "drop": ["b"]}],
+    }
+    lay = build_layout(loads_config(yaml.safe_dump(cfg)), grid_meta(ELL, files, nt=3))
+    assert lay.corners_at(1) == []
+    assert len(lay.corners_at(0)) == 1
 
 
 # --- shift_px -----------------------------------------------------------------

@@ -178,7 +178,7 @@ def resolve_geometry(
     return existing, False
 
 
-def _weights_key(name, t, coords, pairs, tile_shape):
+def _weights_key(name, t, coords, pairs, corners, tile_shape):
     here = coords.at(t)
     parts = []
     for pair in pairs:
@@ -186,7 +186,55 @@ def _weights_key(name, t, coords, pairs, tile_shape):
             continue
         length = int((here[pair.b] - here[pair.a])[pair.axis])
         parts.append((pair.axis, pair.a == name, length))
-    return (tile_shape, tuple(sorted(parts)))
+    corner_parts = []
+    for corner in corners:
+        if (
+            name not in (corner.a, corner.b)
+            or corner.a not in here
+            or corner.b not in here
+        ):
+            continue
+        other = corner.b if corner.a == name else corner.a
+        dy, dx = (int(v) for v in (here[other] - here[name])[1:])
+        corner_parts.append((dy, dx))
+    return (tile_shape, tuple(sorted(parts)), tuple(sorted(corner_parts)))
+
+
+def _corner_taper(dy: int, dx: int, tile_shape):
+    """The 2D ramp for one diagonal neighbour, and where it lands.
+
+    Unlike an edge `Pair`'s ramp -- uniform across the whole perpendicular
+    axis, correct because the tiles overlap along its *entire* length -- a
+    diagonal neighbour only overlaps a small rectangle near the corner. This
+    has to be a genuine 2D patch confined to that rectangle, or it would
+    taper regions of the tile the neighbour never actually reaches.
+
+    `dy`/`dx` are the neighbour's position minus `name`'s, straight out of
+    `coords.at(t)`. The ramp length is `abs(dy)`/`abs(dx)` themselves -- the
+    raw separation, exactly like a `Pair`'s `length` -- not
+    `tile_shape - separation`: a region the neighbour's frame never actually
+    reaches is never covered by anything else either, so the caller's
+    divide-by-accumulated-weight makes any taper there invisible regardless
+    of its exact width (see blend_weights' docstring). What matters is
+    tapering correctly at the tile's own edge, same as every edge Pair does.
+    """
+    oy = abs(dy)
+    ox = abs(dx)
+    if not (0 < oy < tile_shape[1] and 0 < ox < tile_shape[2]):
+        return None  # degenerate placement; leave this corner flat
+    ry = np.linspace(0.01, 0.99, oy, dtype=np.float32)
+    rx = np.linspace(0.01, 0.99, ox, dtype=np.float32)
+    if dy > 0:  # neighbour is below -- name's *bottom* band faces it
+        ry = ry[::-1]
+        y_sl = slice(tile_shape[1] - oy, tile_shape[1])
+    else:  # neighbour is above -- name's *top* band faces it
+        y_sl = slice(0, oy)
+    if dx > 0:  # neighbour is to the right -- name's *right* band faces it
+        rx = rx[::-1]
+        x_sl = slice(tile_shape[2] - ox, tile_shape[2])
+    else:  # neighbour is to the left -- name's *left* band faces it
+        x_sl = slice(0, ox)
+    return y_sl, x_sl, ry[:, np.newaxis] * rx[np.newaxis, :]
 
 
 # Divisor floor for uncovered voxels. Must stay far below the float32 ulp of
@@ -196,8 +244,9 @@ EPS = 1e-12
 WEIGHTS_CACHE_MAX = 24
 
 
-def blend_weights(name, t, coords: Coordinates, pairs, tile_shape, cache=None):
-    """Linear ramps across every edge that has a neighbour.
+def blend_weights(name, t, coords: Coordinates, pairs, corners, tile_shape, cache=None):
+    """Linear ramps across every edge that has a neighbour, plus a 2D taper
+    in the corner rectangle for every diagonal neighbour.
 
     Only the relative shape matters: the caller divides by the accumulated
     weight, so a solo region comes out unchanged whatever its weight was.
@@ -213,7 +262,7 @@ def blend_weights(name, t, coords: Coordinates, pairs, tile_shape, cache=None):
     without limit. When it fills it is dropped whole: consecutive timepoints
     are what share keys, so recent entries are the only ones worth keeping.
     """
-    key = _weights_key(name, t, coords, pairs, tile_shape)
+    key = _weights_key(name, t, coords, pairs, corners, tile_shape)
     if cache is not None:
         hit = cache.get(key)
         if hit is not None:
@@ -238,6 +287,29 @@ def blend_weights(name, t, coords: Coordinates, pairs, tile_shape, cache=None):
         else:
             w[pair.axis - 1][:length] = ramp
     out = w[0][:, np.newaxis] * w[1][np.newaxis, :]
+
+    # A diagonal neighbour never gets an edge Pair (it doesn't share a full
+    # edge), so blend_weights would otherwise leave the corner rectangle at
+    # full weight regardless of the real overlap. `min` rather than another
+    # multiply: each neighbour only ever imposes an upper bound on how much
+    # weight `name` may claim near it, so this is a no-op wherever the edge
+    # ramps above already tapered that rectangle down this far or further --
+    # exactly the case when a third tile completes the square normally.
+    for corner in corners:
+        if (
+            name not in (corner.a, corner.b)
+            or corner.a not in here
+            or corner.b not in here
+        ):
+            continue
+        other = corner.b if corner.a == name else corner.a
+        dy, dx = (int(v) for v in (here[other] - here[name])[1:])
+        patch = _corner_taper(dy, dx, tile_shape)
+        if patch is None:
+            continue
+        y_sl, x_sl, ramp2d = patch
+        out[y_sl, x_sl] = np.minimum(out[y_sl, x_sl], ramp2d)
+
     if cache is not None:
         cache[key] = out
     return out
@@ -344,6 +416,7 @@ def compose_timepoint(
     accum = np.zeros(shape, dtype=np.float32)
     tile_shape = (layout.nz, layout.ny, layout.nx)
     pairs = layout.pairs_at(t)
+    corners = layout.corners_at(t)
     if buffer is None:
         buffer = np.empty(tile_shape, dtype=np.float32)
 
@@ -354,7 +427,9 @@ def compose_timepoint(
             continue
         z0, y0, x0 = (int(v) for v in np.array(boxes[name][0]) - origin)
         placed[name] = (z0, y0, x0)
-        weights = blend_weights(name, t, coords, pairs, tile_shape, weights_cache)
+        weights = blend_weights(
+            name, t, coords, pairs, corners, tile_shape, weights_cache
+        )
         weights_by_tile[name] = weights
         np.copyto(buffer, frame, casting="unsafe")
         np.multiply(buffer, weights, out=buffer)

@@ -155,7 +155,10 @@ def cmd_graph(args) -> int:
     ambiguous = [p for p in places if p.ambiguous]
     stuck = [p for p in places if p.unplaced]
 
-    print(f"tiles      {len(layout.tiles)}   pairs {len(layout.pairs)}")
+    print(
+        f"tiles      {len(layout.tiles)}   pairs {len(layout.pairs)}"
+        f"   corners {len(layout.corners)}"
+    )
     print(f"timepoints {t1 - t0}  (t={t0}..{t1 - 1})")
     print(
         f"ambiguous  {len(ambiguous)} timepoint(s)"
@@ -194,7 +197,10 @@ def cmd_status(args) -> int:
 
     print(f"workspace  {ws.root}")
     print(f"timeline   {layout.nt} timepoints across {cfg.n_files} files")
-    print(f"tiles      {len(layout.tiles)}   pairs {len(layout.pairs)}")
+    print(
+        f"tiles      {len(layout.tiles)}   pairs {len(layout.pairs)}"
+        f"   corners {len(layout.corners)}"
+    )
     print(
         f"tasks      {len(plan.tasks)}  ({len(plan.time_tasks)} drift, "
         f"{len(plan.pair_tasks)} pair)"

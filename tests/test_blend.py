@@ -2,12 +2,13 @@ import attrs
 import numpy as np
 import pytest
 import zarr
-from helpers import build, make_meta, stub_files
+from helpers import build, grid_meta, make_meta, stub_files
 
 from multi_nd2_stitching.blend import (
     BlendLog,
     CanvasGeometry,
     CanvasMismatch,
+    _corner_taper,
     bbox_of,
     blend,
     blend_weights,
@@ -21,7 +22,9 @@ from multi_nd2_stitching.blend import (
     union_bbox,
     write_with_retry,
 )
-from multi_nd2_stitching.coordinates import build_coordinates
+from multi_nd2_stitching.config import loads_config
+from multi_nd2_stitching.coordinates import Coordinates, build_coordinates
+from multi_nd2_stitching.layout import Corner, build_layout
 from multi_nd2_stitching.offsets import VolumeRef, build_plan
 from multi_nd2_stitching.store import Offset, OffsetStore
 
@@ -68,14 +71,14 @@ def scene(cfg_dict, tmp_path):
 # --- weights ------------------------------------------------------------------
 def test_weights_are_flat_without_neighbours(scene):
     lay, coords, _, _, _geom = scene
-    w = blend_weights("tile_a", 0, coords, [], (lay.nz, lay.ny, lay.nx))
+    w = blend_weights("tile_a", 0, coords, [], [], (lay.nz, lay.ny, lay.nx))
     assert np.all(w == 1.0)
 
 
 def test_weights_ramp_down_towards_the_neighbour(scene):
     lay, coords, _, _, _geom = scene
     p = lay.pairs[0]
-    w = blend_weights(p.a, 0, coords, lay.pairs_at(0), (lay.nz, lay.ny, lay.nx))
+    w = blend_weights(p.a, 0, coords, lay.pairs_at(0), [], (lay.nz, lay.ny, lay.nx))
     row = w[0]
     assert row[-1] < row[0], "the edge nearest the neighbour must weigh least"
 
@@ -84,8 +87,8 @@ def test_the_two_sides_ramp_oppositely(scene):
     lay, coords, _, _, _geom = scene
     p = lay.pairs[0]
     shape = (lay.nz, lay.ny, lay.nx)
-    wa = blend_weights(p.a, 0, coords, lay.pairs_at(0), shape)[0]
-    wb = blend_weights(p.b, 0, coords, lay.pairs_at(0), shape)[0]
+    wa = blend_weights(p.a, 0, coords, lay.pairs_at(0), [], shape)[0]
+    wb = blend_weights(p.b, 0, coords, lay.pairs_at(0), [], shape)[0]
     assert wa[-1] < wa[0] and wb[0] < wb[-1]
 
 
@@ -95,8 +98,164 @@ def test_degenerate_placement_leaves_weights_flat(scene):
     bad = type(coords)(
         ({"tile_a": np.zeros(3), "tile_b": np.array([0, 0, 999])},) * lay.nt
     )
-    w = blend_weights("tile_a", 0, bad, lay.pairs_at(0), (lay.nz, lay.ny, lay.nx))
+    w = blend_weights("tile_a", 0, bad, lay.pairs_at(0), [], (lay.nz, lay.ny, lay.nx))
     assert np.all(w == 1.0)
+
+
+# --- corners: diagonal overlap with no third tile to anchor it ----------------
+def _ell_coords(nt=2):
+    """a, b (x+3), c (y+3) -- b and c overlap diagonally, nothing sits at
+    their shared corner to connect them via two edge Pairs instead."""
+    frame = {
+        "a": np.array([0, 0, 0]),
+        "b": np.array([0, 0, 3]),
+        "c": np.array([0, 3, 0]),
+    }
+    return Coordinates((frame,) * nt)
+
+
+def test_corner_taper_shape_and_location():
+    tile_shape = (2, 8, 8)
+    patch = _corner_taper(dy=3, dx=-3, tile_shape=tile_shape)
+    assert patch is not None
+    y_sl, x_sl, ramp = patch
+    assert (y_sl, x_sl) == (slice(5, 8), slice(0, 3))
+    assert ramp.shape == (3, 3)
+
+
+def test_corner_taper_decreases_towards_the_neighbour():
+    """other is below-left (dy>0, dx<0): weight must be lowest at the corner
+    deepest into the neighbour's territory (bottom-left of the patch)."""
+    _y_sl, _x_sl, ramp = _corner_taper(dy=3, dx=-3, tile_shape=(2, 8, 8))
+    assert ramp[-1, 0] < ramp[0, 0]  # bottom row (nearest in y) weighs less
+    assert ramp[0, 0] < ramp[0, -1]  # left column (nearest in x) weighs less
+    assert ramp[-1, 0] == pytest.approx(ramp[:, 0].min())
+
+
+def test_corner_taper_opposite_signs_are_complementary():
+    """b sees c below-left (dy>0, dx<0); c sees b above-right (dy<0, dx>0) --
+    each must taper towards its own edge nearest the other."""
+    b_y, b_x, b_ramp = _corner_taper(dy=3, dx=-3, tile_shape=(2, 8, 8))
+    c_y, c_x, c_ramp = _corner_taper(dy=-3, dx=3, tile_shape=(2, 8, 8))
+    assert (b_y, b_x) == (slice(5, 8), slice(0, 3))
+    assert (c_y, c_x) == (slice(0, 3), slice(5, 8))
+    # b's weight is lowest at its bottom-left; c's is lowest at its top-right
+    assert b_ramp[-1, 0] == pytest.approx(b_ramp.min())
+    assert c_ramp[0, -1] == pytest.approx(c_ramp.min())
+
+
+def test_corner_taper_degenerate_offset_is_none():
+    """An offset at or past the tile extent has no real overlap left."""
+    assert _corner_taper(dy=8, dx=3, tile_shape=(2, 8, 8)) is None
+    assert _corner_taper(dy=0, dx=3, tile_shape=(2, 8, 8)) is None
+
+
+def test_blend_weights_tapers_the_corner_rectangle():
+    """Without a `corners` entry, b's y axis never tapers at all (no edge Pair
+    to c). With one, the corner rectangle must taper in both axes."""
+    tile_shape = (2, 8, 8)
+    coords = _ell_coords()
+    corner = Corner("b", "c")
+    flat = blend_weights("b", 0, coords, [], [], tile_shape)
+    tapered = blend_weights("b", 0, coords, [], [corner], tile_shape)
+    assert np.all(flat == 1.0)
+    # outside the corner rectangle (y < 5, or y >= 5 but x outside it): untouched
+    assert np.all(tapered[:5] == 1.0)
+    assert np.all(tapered[5:, 3:] == 1.0)
+    # inside it: strictly less than flat, and least at the deepest corner
+    assert np.all(tapered[5:, :3] < 1.0)
+    assert tapered[-1, 0] == tapered[5:, :3].min()
+
+
+def test_blend_weights_corner_taper_never_exceeds_matching_edge_ramps():
+    """min(), not multiply: when a tile already has BOTH an x- and a y-edge
+    Pair tapering the corner region exactly as far as the diagonal neighbour
+    would -- the normal case when a third tile completes the square -- the
+    corner adds nothing: it is a no-op."""
+    from multi_nd2_stitching.layout import Pair
+
+    tile_shape = (2, 8, 8)
+    coords = Coordinates(
+        (
+            {
+                "b": np.array([0, 0, 3]),
+                "c": np.array([0, 3, 0]),
+                "e": np.array([0, 0, 0]),  # x-neighbour of b, matching length
+            },
+        )
+    )
+    pair_y = Pair("b", "c", axis=1)  # same 3px separation as the corner's dy
+    pair_x = Pair("e", "b", axis=2)  # same 3px separation as the corner's dx
+    corner = Corner("b", "c")
+    edge_only = blend_weights("b", 0, coords, [pair_y, pair_x], [], tile_shape)
+    edge_and_corner = blend_weights(
+        "b", 0, coords, [pair_y, pair_x], [corner], tile_shape
+    )
+    assert np.array_equal(edge_only, edge_and_corner)
+
+
+def test_corner_ignored_when_either_tile_is_absent():
+    coords = Coordinates(({"b": np.array([0, 0, 3])},))
+    w = blend_weights("b", 0, coords, [], [Corner("b", "c")], (2, 8, 8))
+    assert np.all(w == 1.0)
+
+
+@pytest.fixture
+def ell_scene(tmp_path):
+    """a, b (x-neighbour of a), c (y-neighbour of a) -- b and c are diagonal
+    to each other with no fourth tile at their shared corner. Built through
+    the real pipeline (config -> layout -> plan -> coordinates), so this
+    proves layout.py's corner discovery and blend.py's corner tapering are
+    actually wired together, not just individually correct."""
+    import yaml
+
+    files = stub_files(tmp_path, 2)
+    coords = {"a": (0.0, 0.0), "b": (55.0, 0.0), "c": (0.0, 55.0)}
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "shift_px": 5,
+        "positions": {
+            "a": {"start": [0, 0], "reference_in_files": [0, 1]},
+            "b": {"start": [0, 0]},
+            "c": {"start": [0, 0]},
+        },
+    }
+    meta = grid_meta(coords, files, nt=1, nz=2, ny=8, nx=8)
+    lay = build_layout(loads_config(yaml.safe_dump(cfg)), meta)
+    assert {(c.a, c.b) for c in lay.corners} == {("b", "c")}
+    plan = build_plan(lay, meta)
+    store = OffsetStore()
+    for t in plan.time_tasks:
+        store.put(t, Offset(0, 0, 0))
+    for p in plan.pair_tasks:
+        store.put(p, Offset(0, 5, 0) if p.axis == 1 else Offset(0, 0, 5))
+    coords_out = build_coordinates(lay, plan, store)
+    geom = CanvasGeometry.required(
+        coords_out, (lay.nz, lay.ny, lay.nx), lay.nt, "uint16"
+    )
+    return lay, coords_out, geom
+
+
+def _compose_ell(lay, coords, geom):
+    reader = NamedReader({"a": 100.0, "b": 200.0, "c": 300.0}, shape=(2, 8, 8))
+    boxes = tile_boxes(0, lay, coords, geom)
+    region = snap_to_chunks(boxes_bbox(boxes), (1, 1, 1), geom.spatial)
+    volumes = load_timepoint(reader, {(0, n): n for n in boxes}, 0, list(boxes))
+    return compose_timepoint(0, lay, coords, volumes, geom, region, boxes)
+
+
+def test_corner_topology_survives_the_full_pipeline(ell_scene):
+    """Not just a unit check on blend_weights -- build_layout really finds the
+    corner, and compose_timepoint really uses it, for real placed tiles."""
+    lay, coords, geom = ell_scene
+    with_corner = _compose_ell(lay, coords, geom)
+    without_corner = _compose_ell(attrs.evolve(lay, corners=()), coords, geom)
+    assert not np.array_equal(with_corner, without_corner), (
+        "disabling the discovered corner must change the composed image -- "
+        "otherwise the fix isn't actually reachable from the real pipeline"
+    )
 
 
 # --- composing ----------------------------------------------------------------
@@ -568,8 +727,8 @@ def test_weights_cache_returns_the_same_array(scene):
     lay, coords, _, _, _geom = scene
     cache = {}
     shape = (lay.nz, lay.ny, lay.nx)
-    a = blend_weights("tile_a", 0, coords, lay.pairs_at(0), shape, cache)
-    b = blend_weights("tile_a", 1, coords, lay.pairs_at(1), shape, cache)
+    a = blend_weights("tile_a", 0, coords, lay.pairs_at(0), [], shape, cache)
+    b = blend_weights("tile_a", 1, coords, lay.pairs_at(1), [], shape, cache)
     assert a is b, "same placement, same weights -- should be a lookup"
     assert len(cache) == 1
 
@@ -796,7 +955,7 @@ def test_weights_cache_is_bounded(scene):
                 for frame in coords.by_time
             )
         )
-        blend_weights(pair.a, 0, moved, lay.pairs_at(0), shape, cache)
+        blend_weights(pair.a, 0, moved, lay.pairs_at(0), [], shape, cache)
         assert len(cache) <= WEIGHTS_CACHE_MAX
 
 
@@ -804,10 +963,11 @@ def test_weights_cache_still_hits_on_a_steady_placement(scene):
     lay, coords, _refs, _, _geom = scene
     cache = {}
     shape = (lay.nz, lay.ny, lay.nx)
-    first = blend_weights("tile_a", 0, coords, lay.pairs_at(0), shape, cache)
+    first = blend_weights("tile_a", 0, coords, lay.pairs_at(0), [], shape, cache)
     for t in range(lay.nt):
         assert (
-            blend_weights("tile_a", t, coords, lay.pairs_at(t), shape, cache) is first
+            blend_weights("tile_a", t, coords, lay.pairs_at(t), [], shape, cache)
+            is first
         )
 
 
@@ -885,7 +1045,14 @@ def test_composed_values_match_a_reference_implementation(scene):
             slice(y0, y0 + lay.ny),
             slice(x0, x0 + lay.nx),
         )
-        w = blend_weights(name, 0, coords, lay.pairs_at(0), (lay.nz, lay.ny, lay.nx))
+        w = blend_weights(
+            name,
+            0,
+            coords,
+            lay.pairs_at(0),
+            lay.corners_at(0),
+            (lay.nz, lay.ny, lay.nx),
+        )
         accum[sls] += frame * w
         counts[sls] += w
     np.maximum(counts, 1e-12, out=counts)

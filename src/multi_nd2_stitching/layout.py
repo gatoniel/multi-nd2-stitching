@@ -24,6 +24,24 @@ class Pair:
     axis: int
 
 
+@attrs.frozen(order=True)
+class Corner:
+    """Two tiles diagonally adjacent in the nominal grid -- one step away in
+    BOTH y and x at once, not just one axis.
+
+    `_discover_pairs` only ever connects edge-adjacent tiles, so a diagonal
+    relationship like this never becomes a `Pair` and `blend_weights` never
+    tapers for it -- even though the tiles genuinely overlap, in the small
+    rectangle near the corner. This is true whether or not some other tile
+    occupies the corner itself; `a`/`b` are just the two names in sorted
+    order (unlike `Pair`, direction is not baked in here -- `blend_weights`
+    reads the real, possibly-drifted signed offset straight out of
+    `coords.at(t)`, same as it already does for a `Pair`'s ramp length)."""
+
+    a: str
+    b: str
+
+
 @attrs.frozen
 class Tile:
     name: str
@@ -39,6 +57,7 @@ class Layout:
     tiles: tuple[str, ...]
     tile: dict[str, Tile]
     pairs: tuple[Pair, ...]
+    corners: tuple[Corner, ...]
     nts: tuple[int, ...]
     file_start: tuple[int, ...]  # global t at which each file begins
     nt: int
@@ -49,6 +68,7 @@ class Layout:
     shift_px: int
     tile_alive: np.ndarray  # (nt, n_tiles) bool
     pair_alive: np.ndarray  # (nt, n_pairs) bool
+    corner_alive: np.ndarray  # (nt, n_corners) bool
     is_anchor: np.ndarray  # (nt, n_tiles) bool
 
     # --- lookups ---------------------------------------------------------
@@ -67,6 +87,9 @@ class Layout:
 
     def pairs_at(self, t: int) -> list[Pair]:
         return [p for k, p in enumerate(self.pairs) if self.pair_alive[t, k]]
+
+    def corners_at(self, t: int) -> list[Corner]:
+        return [c for k, c in enumerate(self.corners) if self.corner_alive[t, k]]
 
     def anchors_at(self, t: int) -> list[str]:
         return [n for i, n in enumerate(self.tiles) if self.is_anchor[t, i]]
@@ -114,6 +137,34 @@ def _discover_pairs(
     if cfg.flip_y:
         pairs = [Pair(p.b, p.a, p.axis) if p.axis == 1 else p for p in pairs]
     return tuple(sorted(pairs))
+
+
+def _discover_corners(
+    cfg: StitchingConfig, meta: Metadata, tile: dict[str, Tile]
+) -> tuple[Corner, ...]:
+    """Grid-diagonal adjacency: one step away in BOTH x and y at once.
+
+    Unlike `_discover_pairs`, direction is not baked into `a`/`b` here (they
+    are just sorted names) -- `blend_weights` reads the real signed offset
+    straight out of `coords.at(t)` at blend time, so no flip_x/flip_y
+    handling is needed: whichever way the placement pipeline actually
+    resolves the two tiles is what gets used.
+    """
+    lo = cfg.grid_spacing - cfg.grid_spacing_error
+    hi = cfg.grid_spacing + cfg.grid_spacing_error
+
+    found: set[Corner] = set()
+    for file_i, fm in enumerate(meta.files):
+        here = {
+            name: np.array(fm.stage_um[t.position[file_i]])
+            for name, t in tile.items()
+            if t.position[file_i] is not None
+        }
+        for n_i, n_j in combinations(sorted(here), 2):
+            dx, dy = here[n_i] - here[n_j]
+            if lo < abs(dx) < hi and lo < abs(dy) < hi:
+                found.add(Corner(n_i, n_j))
+    return tuple(sorted(found))
 
 
 def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
@@ -164,6 +215,7 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
         )
 
     pairs = _discover_pairs(cfg, meta, tile)
+    corners = _discover_corners(cfg, meta, tile)
 
     # --- masks ------------------------------------------------------------
     tile_alive = np.zeros((nt, len(tiles)), dtype=bool)
@@ -197,6 +249,12 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
             tile_alive[:, tiles.index(p.a)] & tile_alive[:, tiles.index(p.b)]
         )
 
+    corner_alive = np.zeros((nt, len(corners)), dtype=bool)
+    for k, c in enumerate(corners):
+        corner_alive[:, k] = (
+            tile_alive[:, tiles.index(c.a)] & tile_alive[:, tiles.index(c.b)]
+        )
+
     shift_px = (
         cfg.shift_px
         if cfg.shift_px is not None
@@ -208,6 +266,7 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
         tiles=tiles,
         tile=tile,
         pairs=pairs,
+        corners=corners,
         nts=nts,
         file_start=file_start,
         nt=nt,
@@ -218,5 +277,6 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
         shift_px=shift_px,
         tile_alive=tile_alive,
         pair_alive=pair_alive,
+        corner_alive=corner_alive,
         is_anchor=is_anchor,
     )

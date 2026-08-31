@@ -86,6 +86,16 @@ traversal order. Those are flagged, never silently resolved.
 owns that axis; cropping it removes the overlap strip the correlation needs.
 See `Crop.free_axis`.
 
+**A diagonal neighbour never gets an edge `Pair`.** Two tiles can overlap
+across a corner (one grid step away in both y and x) with no third tile
+occupying the missing corner position to connect them via two edge `Pair`s
+instead. `layout._discover_corners` finds this relationship separately
+(`Corner`, no `axis` — it tapers both), and `blend_weights` folds its 2D
+patch into the edge ramps via `min`, never multiply: each neighbour only
+ever imposes an upper bound on the weight `blend_weights` may hand back, so
+a well-covered corner (a real third tile *is* there) is a no-op, and an
+under-covered one (there isn't) gets tapered for the first time.
+
 **Per-timepoint blend work is bounded by the bounding box, not the canvas.**
 A whole-canvas `np.divide` costs in proportion to the canvas, which makes
 padding ruinously expensive. Same for zarr writes: they must start on chunk
@@ -142,17 +152,3 @@ boundaries or zarr read-modify-writes every partial chunk.
 - Measure before attributing a slowdown. Several plausible causes in this
   codebase turned out to be noise; the real ones were unaligned zarr writes and
   whole-canvas passes.
-
-## Planned work
-
-Not designed in detail yet; recorded here so the reasoning survives until
-someone picks it up.
-
-- **B. Corner overlaps get no feather blend.** Two tiles can overlap across a
-  corner (diagonal, no shared edge) without a third tile there to anchor
-  that corner. `layout._discover_pairs` only creates a `Pair` for
-  edge-adjacent tiles, and `blend_weights` only tapers a tile's edge where a
-  `Pair` exists for that axis — so a corner with no pair gets full (1.0)
-  weight from both tiles regardless of overlap, and the seam shows in the
-  blended canvas. Needs a way to detect corner overlaps with no defining
-  third neighbour and taper both tiles' weight there too.
