@@ -96,6 +96,9 @@ traversal order rather than on the data. `stitch graph` finds these.
 One block per incident, at one or more timepoints. `reason` is not decoration —
 in six months it is the only record of why a timepoint was special.
 
+`at` takes an int, a list of ints, or an inclusive `"start-end"` range
+string, mixed freely: `at: ["20-40", 45]` means t = 20, 21, ..., 40, 45.
+
 | verb | tile placed? | in the neighbour graph? | drifts from t-1? |
 | --- | --- | --- | --- |
 | `drop` | no | no | no |

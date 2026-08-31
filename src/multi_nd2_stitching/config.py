@@ -1,3 +1,5 @@
+import re
+
 import attrs
 from cattrs.preconf.pyyaml import make_converter
 
@@ -14,13 +16,33 @@ def _structure_slices(data, _) -> Slices3D:
     return tuple(slice(*data.get(axis, (None, None))) for axis in _AXES)
 
 
+_AT_RANGE = re.compile(r"(\d+)-(\d+)")
+
+
+def _expand_at_range(s: str) -> range:
+    m = _AT_RANGE.fullmatch(s)
+    if not m:
+        raise ValueError(
+            f"'{s}' is not a valid 'at' entry: expected an integer or 'start-end'"
+        )
+    lo, hi = int(m[1]), int(m[2])
+    if hi < lo:
+        raise ValueError(f"'{s}': range end {hi} is before start {lo}")
+    return range(lo, hi + 1)  # inclusive
+
+
 def _structure_at(data, _) -> tuple[int, ...]:
-    """`at: 143` and `at: [4, 16]` both mean a set of timepoints."""
+    """`at: 143`, `at: "20-40"`, and a list mixing either -- e.g.
+    `at: [4, 16, "20-40"]` -- all mean a set of timepoints. A range string is
+    inclusive on both ends."""
     if data is None:
         return ()
-    if isinstance(data, int):
-        return (data,)
-    return tuple(data)
+    if isinstance(data, (int, str)):
+        data = [data]
+    out: list[int] = []
+    for entry in data:
+        out.extend(_expand_at_range(entry) if isinstance(entry, str) else [entry])
+    return tuple(out)
 
 
 def clamp_z(slices: Slices3D, min_nz: int) -> Slices3D:

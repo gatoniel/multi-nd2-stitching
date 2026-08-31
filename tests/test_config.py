@@ -91,11 +91,29 @@ def test_required_missing_raises(cfg_dict, parse, field):
         (143, (143,)),
         ([143], (143,)),
         ([4, 16, 26], (4, 16, 26)),
+        ("20-23", (20, 21, 22, 23)),
+        (["20-23"], (20, 21, 22, 23)),
+        (["4-4"], (4,)),  # single-point range
+        (["20-23", 45], (20, 21, 22, 23, 45)),
+        ([4, "20-23", 45], (4, 20, 21, 22, 23, 45)),
     ],
 )
 def test_at_scalar_or_list(cfg_dict, parse, given, expected):
     cfg_dict["overrides"] = [{"at": given, "drop": ["tile_b"]}]
     assert parse(cfg_dict).overrides[0].at == expected
+
+
+@pytest.mark.parametrize("given", ["20-4x", "20-", "-20", "abc"])
+def test_at_range_malformed_is_loud(cfg_dict, parse, given):
+    cfg_dict["overrides"] = [{"at": [given], "drop": ["tile_b"]}]
+    with pytest.raises((ValueError, BaseValidationError)):
+        parse(cfg_dict)
+
+
+def test_at_range_reversed_is_loud(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": ["40-20"], "drop": ["tile_b"]}]
+    with pytest.raises((ValueError, BaseValidationError)):
+        parse(cfg_dict)
 
 
 # --- alive_in_file: `end` is EXCLUSIVE ----------------------------------------
