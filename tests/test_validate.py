@@ -58,6 +58,15 @@ def test_realistic_config_is_valid(cfg_dict, parse):
             lambda d: d["positions"]["tile_a"].update(reference_in_files=[5]),
             "out of range",
         ),
+        # position_in_files
+        (
+            lambda d: d["positions"]["tile_b"].update(position_in_files={5: 0}),
+            "out of range",
+        ),
+        (
+            lambda d: d["positions"]["tile_b"].update(end=1, position_in_files={1: 0}),
+            "names file 1 but is only alive",
+        ),
         # global
         (lambda d: d.update(grid_spacing_error=30), "windows overlap"),
         (lambda d: d.update(files=["a.nd2", "a.nd2"]), "duplicates"),
@@ -104,6 +113,21 @@ def test_detects_override_problem(cfg_dict, parse, override, fragment):
 
 def test_dropping_a_reference_with_an_anchor_is_fine(cfg_dict, parse):
     cfg_dict["overrides"] = [{"at": 143, "drop": ["tile_a"], "anchor": ["tile_b"]}]
+    assert check(parse(cfg_dict)) == []
+
+
+# --- position_in_files ---------------------------------------------------------
+def test_position_in_files_collision_is_flagged(cfg_dict, parse):
+    cfg_dict["positions"]["tile_a"]["position_in_files"] = {0: 1}
+    cfg_dict["positions"]["tile_b"]["position_in_files"] = {0: 1}
+    problems = check(parse(cfg_dict))
+    assert any("also claimed by" in p for p in problems), problems
+
+
+def test_position_in_files_mixed_with_a_named_file_is_fine(cfg_dict, parse):
+    """One file resolved by index, the other still by name -- the whole
+    point is being able to mix both for the same tile."""
+    cfg_dict["positions"]["tile_b"]["position_in_files"] = {0: 1}
     assert check(parse(cfg_dict)) == []
 
 

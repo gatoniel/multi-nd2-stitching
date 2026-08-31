@@ -190,12 +190,31 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
     # --- tiles ------------------------------------------------------------
     tiles = tuple(sorted(cfg.positions))
     tile: dict[str, Tile] = {}
+    # (file, position index) -> tile name, across every tile resolved so far --
+    # an override index is easy to typo into another tile's slot in a way a
+    # name match structurally could not, so this is checked regardless of how
+    # either tile's position got resolved.
+    seen_positions: dict[tuple[int, int], str] = {}
     for name in tiles:
         pos = cfg.positions[name]
         names = (name, *(a for a in pos.aliases if a != name))
         end_file = n_files if pos.end is None else pos.end
+        for i, pi in pos.position_in_files.items():
+            if pos.start[0] <= i < end_file and not 0 <= pi < len(
+                meta[i].position_names
+            ):
+                raise ValueError(
+                    f"'{name}'.position_in_files[{i}] = {pi} is out of range "
+                    f"(file {i} has {len(meta[i].position_names)} position(s))"
+                )
         position = tuple(
-            meta[i].position_of(names) if pos.start[0] <= i < end_file else None
+            (
+                pos.position_in_files[i]
+                if i in pos.position_in_files
+                else meta[i].position_of(names)
+            )
+            if pos.start[0] <= i < end_file
+            else None
             for i in range(n_files)
         )
         missing = [i for i in range(pos.start[0], end_file) if position[i] is None]
@@ -204,6 +223,16 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
                 f"'{name}' should be alive in files {pos.start[0]}..{end_file - 1} "
                 f"but no matching position exists in files {missing}"
             )
+        for i, pi in enumerate(position):
+            if pi is None:
+                continue
+            key = (i, pi)
+            if key in seen_positions:
+                raise ValueError(
+                    f"'{name}' and '{seen_positions[key]}' both resolve to "
+                    f"position {pi} in file {i}"
+                )
+            seen_positions[key] = name
         tile[name] = Tile(
             name=name,
             aliases=names,

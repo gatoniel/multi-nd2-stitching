@@ -11,6 +11,7 @@ from multi_nd2_stitching.config import clamp_z
         ("end", None),
         ("aliases", []),
         ("reference_in_files", []),
+        ("position_in_files", {}),
     ],
 )
 def test_position_optional_absent(cfg_dict, parse, field, expected):
@@ -58,6 +59,16 @@ def test_stop_at_present(cfg_dict, parse):
 def test_position_explicit_null(cfg_dict, parse, field):
     cfg_dict["positions"]["tile_b"][field] = None
     assert getattr(parse(cfg_dict).positions["tile_b"], field) == []
+
+
+def test_position_in_files_explicit_null(cfg_dict, parse):
+    cfg_dict["positions"]["tile_b"]["position_in_files"] = None
+    assert parse(cfg_dict).positions["tile_b"].position_in_files == {}
+
+
+def test_position_in_files_round_trips(cfg_dict, parse):
+    cfg_dict["positions"]["tile_b"]["position_in_files"] = {3: 2, 5: 0}
+    assert parse(cfg_dict).positions["tile_b"].position_in_files == {3: 2, 5: 0}
 
 
 @pytest.mark.parametrize(

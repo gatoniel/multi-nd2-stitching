@@ -71,6 +71,11 @@ class Position:
     start: (file index, timepoint within that file) where the tile first appears
     end:   file index at which it stops existing, EXCLUSIVE. None = until the end.
            `start: [3, 20], end: 8` means alive in files 3..7.
+    position_in_files: {3: 2} forces file 3's position 2 for this tile,
+           bypassing name matching there entirely -- for files whose positions
+           were never named (nd2 forbids adding one after acquisition, so
+           there is no other way to resolve them). Files not listed still
+           resolve by name as before; a tile can mix both across its files.
     """
 
     start: tuple[int, int]
@@ -78,6 +83,9 @@ class Position:
     aliases: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
     reference_in_files: list[int] | None = attrs.field(
         factory=list, converter=_none_to_list
+    )
+    position_in_files: dict[int, int] | None = attrs.field(
+        factory=dict, converter=_none_to_dict
     )
 
     def alive_in_file(self, file_i: int, n_files: int) -> bool:

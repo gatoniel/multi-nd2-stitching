@@ -51,6 +51,7 @@ def _check_realign(cfg: StitchingConfig, p: list[str]) -> None:
 
 def _check_positions(cfg: StitchingConfig, p: list[str]) -> None:
     n = cfg.n_files
+    seen_indices: dict[tuple[int, int], str] = {}
     for name, pos in cfg.positions.items():
         where = f"positions.{name}"
         f0, t0 = pos.start
@@ -82,6 +83,29 @@ def _check_positions(cfg: StitchingConfig, p: list[str]) -> None:
                 )
         if len(set(pos.reference_in_files)) != len(pos.reference_in_files):
             p.append(f"{where}.reference_in_files: contains duplicates")
+
+        # An index override must name a file this tile is actually alive in,
+        # and must not claim a slot another position already claimed there --
+        # metadata isn't available yet, so this only catches the config-only
+        # half; the general case (including a collision against a
+        # name-matched tile) is build_layout's job.
+        for f, pi in sorted(pos.position_in_files.items()):
+            if not 0 <= f < n:
+                p.append(f"{where}.position_in_files: file index {f} out of range")
+                continue
+            if not pos.alive_in_file(f, n):
+                p.append(
+                    f"{where}.position_in_files: names file {f} but is only alive "
+                    f"in files {f0}..{pos.last_file(n)}"
+                )
+            key = (f, pi)
+            if key in seen_indices:
+                p.append(
+                    f"{where}.position_in_files: file {f} position {pi} is also "
+                    f"claimed by '{seen_indices[key]}'"
+                )
+            else:
+                seen_indices[key] = name
 
 
 def _check_coverage(cfg: StitchingConfig, p: list[str]) -> None:

@@ -152,6 +152,90 @@ def test_alias_resolves_a_renamed_position(cfg_dict):
     assert lay.tile["renamed"].position == (1, 1)
 
 
+# --- position_in_files: resolving a position by index, not name ---------------
+def _blank_names(meta, file_i):
+    """Same metadata, but file_i's positions have no names -- as if nd2
+    never recorded one, which is exactly what position_in_files is for."""
+    from multi_nd2_stitching.metadata import Metadata
+
+    files = list(meta.files)
+    m = files[file_i]
+    files[file_i] = m.__class__(
+        **{
+            **{f.name: getattr(m, f.name) for f in m.__attrs_attrs__},
+            "position_names": tuple("" for _ in m.position_names),
+        }
+    )
+    return Metadata(tuple(files))
+
+
+def _meta_with_extra_position(n_files=2, nt=5):
+    """Like make_meta's default line, but each file has a third, unclaimed
+    position -- lets a test force an override onto an index no configured
+    tile would ever name-match, with no collision risk."""
+    from multi_nd2_stitching.metadata import FileMeta, Metadata
+
+    return Metadata(
+        tuple(
+            FileMeta(
+                path=f"f{i}.nd2",
+                nt=nt,
+                nz=80,
+                ny=724,
+                nx=724,
+                position_names=("tile_a", "tile_b", "extra"),
+                stage_um=((0.0, 0.0), (55.0, 0.0), (110.0, 0.0)),
+                voxel_x_um=0.1,
+            )
+            for i in range(n_files)
+        )
+    )
+
+
+def test_position_in_files_resolves_without_any_name_match(cfg_dict):
+    meta = _blank_names(make_meta(n_files=2, nt=5), 0)
+    cfg_dict["positions"]["tile_a"]["position_in_files"] = {0: 0}
+    cfg_dict["positions"]["tile_b"]["position_in_files"] = {0: 1}
+    lay = build_layout(loads_config(yaml.safe_dump(cfg_dict)), meta)
+    assert lay.tile["tile_a"].position[0] == 0
+    assert lay.tile["tile_b"].position[0] == 1
+
+
+def test_position_in_files_mixes_with_name_resolution_across_files(cfg_dict):
+    """File 0 has no names (needs the override); file 1 does (still resolves
+    by name) -- both for the same tile."""
+    meta = _blank_names(make_meta(n_files=2, nt=5), 0)
+    cfg_dict["positions"]["tile_a"]["position_in_files"] = {0: 0}
+    cfg_dict["positions"]["tile_b"]["position_in_files"] = {0: 1}
+    lay = build_layout(loads_config(yaml.safe_dump(cfg_dict)), meta)
+    assert lay.tile["tile_a"].position == (0, 0)
+    assert lay.tile["tile_b"].position == (1, 1)
+
+
+def test_position_in_files_overrides_even_when_a_name_would_match(cfg_dict):
+    meta = _meta_with_extra_position()
+    cfg_dict["positions"]["tile_a"]["position_in_files"] = {0: 2}
+    lay = build_layout(loads_config(yaml.safe_dump(cfg_dict)), meta)
+    assert lay.tile["tile_a"].position[0] == 2  # not 0, which the name matches
+    assert lay.tile["tile_b"].position[0] == 1  # untouched, still resolves by name
+
+
+def test_position_in_files_out_of_range_is_loud(cfg_dict):
+    meta = make_meta(n_files=2, nt=5)  # 2 named positions per file
+    cfg_dict["positions"]["tile_a"]["position_in_files"] = {0: 5}
+    with pytest.raises(ValueError, match="out of range"):
+        build_layout(loads_config(yaml.safe_dump(cfg_dict)), meta)
+
+
+def test_position_in_files_collision_with_a_name_match_is_loud(cfg_dict):
+    """The general safety net tier 1 can't provide: an override colliding
+    with a *different* tile's name-matched position."""
+    meta = make_meta(n_files=2, nt=5)
+    cfg_dict["positions"]["tile_a"]["position_in_files"] = {0: 1}  # tile_b's slot
+    with pytest.raises(ValueError, match="both resolve to position 1 in file 0"):
+        build_layout(loads_config(yaml.safe_dump(cfg_dict)), meta)
+
+
 # --- pair discovery -----------------------------------------------------------
 def test_pairs_found_along_x(cfg_dict):
     lay = build(cfg_dict, axis="x")

@@ -81,6 +81,11 @@ Neighbours are **not** declared. They are inferred from the stage coordinates
 in the ND2 headers: two tiles are neighbours if they sit `grid_spacing ±
 grid_spacing_error` apart along x or y.
 
+Positions are matched by name, but nd2 forbids adding one after acquisition --
+some files never get one. `position_in_files: {0: 2}` resolves a tile to file
+0's position 2 directly, bypassing name matching for exactly that file; other
+files for the same tile can still resolve by name as usual.
+
 ### Anchors
 
 One tile per connected component carries the drift from timepoint to timepoint;
