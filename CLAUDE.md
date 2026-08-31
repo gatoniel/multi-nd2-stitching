@@ -129,6 +129,11 @@ boundaries or zarr read-modify-writes every partial chunk.
   is past it, or `tiles_at()` indexes straight past the truncated mask).
 - Drift is absolute: placing timepoint `t` needs every drift step from 0.
   Pair offsets are local to their timepoint.
+- `Override.near`'s `[dz, dy, dx]` is in *measured* (final-offset) space --
+  the same units as `candidates.csv`'s `dz,dy,dx` columns. `run_task` has to
+  subtract `PairTask.shift_px` back out before the value means anything to
+  `compute._windowed_peak_index`, which searches the *raw* (pre-`shift_px`)
+  space, same as `to_signed_shift` always has.
 - The `nd2` handle is not thread-safe. Never peek into the handle pool
   (`pool.queue[0]`); check a handle out, or use the reserved index handle.
 - `np.zeros` hands back lazily-zeroed pages, so allocating a fresh buffer per

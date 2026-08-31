@@ -84,6 +84,12 @@ def test_detects_problem(cfg_dict, parse, mutate, fragment):
         ({"at": 5, "shaped_peak": ["nope"]}, "unknown position"),
         ({"at": 5, "shaped_peak": ["tile_a,nope"]}, "unknown position"),
         ({"at": 5, "shaped_peak": ["a,b,c"]}, "tile name or an 'a,b' pair"),
+        # near
+        ({"at": 5, "near": {"tile_a": [0, 1, 2]}}, "no matching shaped_peak entry"),
+        (
+            {"at": 5, "shaped_peak": ["tile_a"], "near": {"tile_a": [0, 1]}},
+            "must be [dz, dy, dx] (3 integers)",
+        ),
     ],
 )
 def test_detects_override_problem(cfg_dict, parse, override, fragment):
@@ -105,6 +111,17 @@ def test_shaped_peak_only_block_is_not_a_no_op(cfg_dict, parse):
 
 def test_shaped_peak_tile_name_form_is_fine(cfg_dict, parse):
     cfg_dict["overrides"] = [{"at": 5, "shaped_peak": ["tile_a"]}]
+    assert check(parse(cfg_dict)) == []
+
+
+def test_shaped_peak_with_a_matching_near_hint_is_fine(cfg_dict, parse):
+    cfg_dict["overrides"] = [
+        {
+            "at": 5,
+            "shaped_peak": ["tile_a,tile_b"],
+            "near": {"tile_a,tile_b": [0, 4, -2]},
+        }
+    ]
     assert check(parse(cfg_dict)) == []
 
 

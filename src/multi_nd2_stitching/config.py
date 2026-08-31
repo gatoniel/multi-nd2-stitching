@@ -39,6 +39,7 @@ converter.register_structure_hook_func(lambda t: t is Timepoints, _structure_at)
 # NOTE: the annotation must admit None, or cattrs raises while structuring and
 # the converter never runs. `= None` alone is not enough.
 _none_to_list = attrs.converters.default_if_none(factory=list)
+_none_to_dict = attrs.converters.default_if_none(factory=dict)
 
 
 @attrs.define(kw_only=True)
@@ -93,6 +94,15 @@ class Override:
     --pair` uses) -- unlike the other four verbs, it never changes which tiles
     exist or how they're connected, only how one correlation's peak is picked,
     so it is deliberately not part of `names`.
+
+    `near` gives a rough manual estimate of the true offset for a
+    `shaped_peak` entry -- `{"a,b": [dz, dy, dx]}`, in the same units already
+    shown in `candidates.csv`'s `dz,dy,dx` columns or `offsets.csv`'s drift
+    columns. When present, the peak search for that name is restricted to a
+    window around this point instead of ranked by shape at all -- see
+    `compute._windowed_peak_index`. Every key must also appear in
+    `shaped_peak`; a hint with nothing to attach to is an error, not a
+    silent no-op.
     """
 
     at: Timepoints
@@ -102,6 +112,9 @@ class Override:
     anchor: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
     realign: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
     shaped_peak: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
+    near: dict[str, list[int]] | None = attrs.field(
+        factory=dict, converter=_none_to_dict
+    )
 
     @property
     def names(self) -> set[str]:
@@ -167,6 +180,13 @@ class StitchingConfig:
     def shaped_peak_at(self, t: int) -> set[str]:
         """Tile names and/or 'a,b' pair strings, whichever this override names."""
         return {n for o in self.overrides if t in o.at for n in o.shaped_peak}
+
+    def near_hint(self, name: str, t: int) -> tuple[int, int, int] | None:
+        """The rough (dz, dy, dx) estimate for `name` at `t`, if one was given."""
+        for o in self.overrides:
+            if t in o.at and name in o.near:
+                return tuple(o.near[name])
+        return None
 
 
 def loads_config(text: str) -> StitchingConfig:

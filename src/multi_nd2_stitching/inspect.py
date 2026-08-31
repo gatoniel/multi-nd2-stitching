@@ -153,19 +153,46 @@ def _write_candidate_csvs(out_dir, surface, shape, nominal_shift, measured) -> N
 
     `candidates.csv` lists the same `SHAPED_PEAK_CANDIDATES` points the real
     `shaped_peak` override would consider -- so this is exactly what that
-    override sees, not a separately-tuned debug view. `profiles.csv` gives
-    each candidate's drop-off curve along every axis, to plot "does this
-    actually look like a peak" without needing a plot exported for you.
+    override sees, not a separately-tuned debug view. `px_z/px_y/px_x` are
+    the same point's index into the `response.zarr` written alongside it
+    (already fftshift-centred), so a candidate can be found there directly
+    instead of converting `dz,dy,dx` back by hand. `profiles.csv` gives each
+    candidate's drop-off curve along every axis, to plot "does this actually
+    look like a peak" without needing a plot exported for you.
     """
     cands = candidate_peaks(surface, candidates=SHAPED_PEAK_CANDIDATES)
     shifts = [np.array(to_signed_shift(c.index, shape)) + nominal_shift for c in cands]
+    half = np.array(shape) // 2
 
     with (out_dir / "candidates.csv").open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["rank", "dz", "dy", "dx", "value", "decay", "taken"])
+        w.writerow(
+            [
+                "rank",
+                "dz",
+                "dy",
+                "dx",
+                "px_z",
+                "px_y",
+                "px_x",
+                "value",
+                "decay",
+                "taken",
+            ]
+        )
         for rank, (c, shift) in enumerate(zip(cands, shifts, strict=True), start=1):
+            px = (shift - nominal_shift + half) % np.array(shape)
             taken = int(np.array_equal(shift, measured))
-            w.writerow([rank, *(int(v) for v in shift), c.value, c.decay, taken])
+            w.writerow(
+                [
+                    rank,
+                    *(int(v) for v in shift),
+                    *(int(v) for v in px),
+                    c.value,
+                    c.decay,
+                    taken,
+                ]
+            )
 
     with (out_dir / "profiles.csv").open("w", newline="") as f:
         w = csv.writer(f)

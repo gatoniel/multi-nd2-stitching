@@ -99,6 +99,7 @@ class TimeTask:
     precision: str = "float32"
     realign: bool = False
     shaped_peak: bool = False
+    near: tuple[int, int, int] | None = None
 
     kind = "time"
 
@@ -112,6 +113,7 @@ class TimeTask:
                 self.crop.key(),
                 self.precision,
                 self.shaped_peak,
+                self.near,
             ]
         )
 
@@ -141,6 +143,7 @@ class PairTask:
     shift_px: int
     precision: str = "float32"
     shaped_peak: bool = False
+    near: tuple[int, int, int] | None = None
 
     kind = "pair"
 
@@ -156,6 +159,7 @@ class PairTask:
                 self.crop.key(),
                 self.precision,
                 self.shaped_peak,
+                self.near,
             ]
         )
 
@@ -285,6 +289,7 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                     precision=precision,
                     realign=realign,
                     shaped_peak=name in cfg.shaped_peak_at(t),
+                    near=cfg.near_hint(name, t),
                 )
             )
 
@@ -305,6 +310,10 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                     precision=precision,
                     shaped_peak=(
                         f"{p.a},{p.b}" in shaped_at_t or f"{p.b},{p.a}" in shaped_at_t
+                    ),
+                    near=(
+                        cfg.near_hint(f"{p.a},{p.b}", t)
+                        or cfg.near_hint(f"{p.b},{p.a}", t)
                     ),
                 )
             )

@@ -11,6 +11,7 @@ from multi_nd2_stitching.compute import (
     phase_corr_from_ffts,
     run_plan,
     run_task,
+    to_signed_shift,
 )
 from multi_nd2_stitching.offsets import Crop, PairTask, TimeTask, VolumeRef
 from multi_nd2_stitching.store import Offset, OffsetStore
@@ -143,6 +144,61 @@ def test_phase_corr_from_ffts_shaped_true_uses_the_shaped_index(monkeypatch):
     result = tuple(phase_corr_from_ffts(fft0, fft1, a.shape, shaped=True))
     assert result == (0, 0, 0)
     assert calls == [a.shape]
+
+
+# --- near: restrict the search to a window around a manual hint ---------------
+def test_windowed_peak_index_finds_the_hinted_peak_ignoring_a_taller_one_outside():
+    arr = np.zeros((8, 8, 8))
+    arr[1:4, 2, 2] = 8.0  # taller artifact, well outside the window below
+    arr[5, 5, 5] = 6.0
+    near = C.to_signed_shift((5, 5, 5), arr.shape)
+    assert C._windowed_peak_index(arr, near, radius=2) == (5, 5, 5)
+
+
+def test_windowed_peak_index_prefers_tallest_within_window_regardless_of_shape():
+    """Unlike _shaped_peak_index, this is a plain argmax once windowed -- no
+    shape filtering. A sharp spike beats a broader, more isotropic bump if
+    it's simply taller, as long as both are inside the window."""
+    arr = np.zeros((8, 8, 8))
+    arr[5, 5, 5] = 6.0  # isotropic bump
+    arr[4, 4, 4] = 4.0
+    arr[6, 4, 4] = arr[4, 6, 4] = arr[4, 4, 6] = 3.0
+    arr[3, 3, 3] = 9.0  # sharp, unshaped spike, still inside a radius-3 window
+    near = C.to_signed_shift((5, 5, 5), arr.shape)
+    assert C._windowed_peak_index(arr, near, radius=3) == (3, 3, 3)
+
+
+def test_windowed_peak_index_wraps_around():
+    arr = np.zeros((8, 8, 8))
+    arr[7, 4, 4] = 5.0
+    near = C.to_signed_shift((0, 4, 4), arr.shape)  # hint centred on index 0
+    assert C._windowed_peak_index(arr, near, radius=2) == (7, 4, 4)
+
+
+def test_phase_corr_from_ffts_near_overrides_shaped_and_argmax(monkeypatch):
+    """The tmp_profiles finding, reproduced directly: a taller, better-shaped
+    artifact beats the real (shorter, less isotropic) peak under both plain
+    argmax and the decay-based `shaped` pick. Only a `near` hint pointed at
+    the real peak, far enough away that the window excludes the artifact
+    entirely, recovers it."""
+    shape = (48, 48, 48)
+    arr = np.zeros(shape)
+    arr[6, 6, 6] = 8.0  # taller AND better-shaped artifact
+    arr[5, 6, 6] = arr[7, 6, 6] = 5.0
+    arr[6, 5, 6] = arr[6, 7, 6] = 5.0
+    arr[6, 6, 5] = arr[6, 6, 7] = 5.0
+    arr[30, 30, 30] = 5.0  # the real peak: shorter, decays less cleanly
+    arr[29, 30, 30] = arr[31, 30, 30] = 4.0
+    arr[30, 29, 30] = arr[30, 31, 30] = 4.0
+    arr[30, 30, 29] = arr[30, 30, 31] = 4.0
+
+    monkeypatch.setattr(C, "correlation_surface", lambda *a, **k: arr)
+    assert np.unravel_index(np.argmax(arr), shape) == (6, 6, 6)
+    assert C._shaped_peak_index(arr) == (6, 6, 6)  # even shaped is fooled
+
+    near = to_signed_shift((30, 30, 30), shape)
+    result = phase_corr_from_ffts(None, None, shape, shaped=True, near=near)
+    assert tuple(result) == tuple(to_signed_shift((30, 30, 30), shape))
 
 
 # --- candidate_peaks / axis_profile: the data stitch inspect exports ----------
@@ -301,6 +357,77 @@ def test_crop_is_applied_before_correlation():
     )
     out = run_task(task, Spectra(reader))
     assert out.dy == -4  # y shift still recovered from the z-cropped stack
+
+
+def test_run_task_converts_near_from_measured_to_raw_space_for_pair_task(monkeypatch):
+    """`near` on a PairTask is measured (post shift_px) space; run_task must
+    subtract shift_px back out before it means anything to the windowed
+    search -- the mirror of the `+=` it does to the result."""
+    captured = {}
+
+    def fake_phase_corr(fft0, fft1, shape, workers=-1, shaped=False, near=None):
+        captured["near"] = tuple(near) if near is not None else None
+        return np.zeros(3, dtype=int)
+
+    monkeypatch.setattr(C, "phase_corr_from_ffts", fake_phase_corr)
+    src, dst = _refs()
+    task = PairTask(
+        a="a",
+        b="b",
+        axis=2,
+        t=0,
+        src=src,
+        dst=dst,
+        crop=Crop((None, None), (None, None), (None, None)),
+        shift_px=20,
+        near=(1, 2, 23),
+    )
+    run_task(task, Spectra(FakeReader()))
+    assert captured["near"] == (1, 2, 3)
+
+
+def test_run_task_leaves_near_unconverted_for_time_task(monkeypatch):
+    """A TimeTask has no shift_px -- its `near` is already in raw space."""
+    captured = {}
+
+    def fake_phase_corr(fft0, fft1, shape, workers=-1, shaped=False, near=None):
+        captured["near"] = tuple(near) if near is not None else None
+        return np.zeros(3, dtype=int)
+
+    monkeypatch.setattr(C, "phase_corr_from_ffts", fake_phase_corr)
+    src, dst = _refs()
+    task = TimeTask(
+        name="a",
+        t_from=0,
+        t_to=1,
+        src=src,
+        dst=dst,
+        crop=Crop((None, None), (None, None), (None, None)),
+        near=(1, 2, 3),
+    )
+    run_task(task, Spectra(FakeReader()))
+    assert captured["near"] == (1, 2, 3)
+
+
+def test_run_task_near_none_passes_none_through(monkeypatch):
+    captured = {}
+
+    def fake_phase_corr(fft0, fft1, shape, workers=-1, shaped=False, near=None):
+        captured["near"] = near
+        return np.zeros(3, dtype=int)
+
+    monkeypatch.setattr(C, "phase_corr_from_ffts", fake_phase_corr)
+    src, dst = _refs()
+    task = TimeTask(
+        name="a",
+        t_from=0,
+        t_to=1,
+        src=src,
+        dst=dst,
+        crop=Crop((None, None), (None, None), (None, None)),
+    )
+    run_task(task, Spectra(FakeReader()))
+    assert captured["near"] is None
 
 
 def test_unknown_task_type_is_loud():

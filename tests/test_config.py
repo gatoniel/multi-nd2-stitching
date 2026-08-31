@@ -162,6 +162,43 @@ def test_shaped_peak_coexists_with_other_verbs_in_one_block(cfg_dict, parse):
     assert cfg.shaped_peak_at(5) == {"tile_a"}
 
 
+# --- near: a rough manual estimate attached to a shaped_peak entry ------------
+def test_near_absent_defaults_to_empty_dict(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 5, "shaped_peak": ["tile_a"]}]
+    assert parse(cfg_dict).overrides[0].near == {}
+
+
+def test_near_explicit_null_defaults_to_empty_dict(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 5, "shaped_peak": ["tile_a"], "near": None}]
+    assert parse(cfg_dict).overrides[0].near == {}
+
+
+def test_near_hint_returns_the_configured_shift(cfg_dict, parse):
+    cfg_dict["overrides"] = [
+        {
+            "at": 21,
+            "shaped_peak": ["tile_a,tile_b"],
+            "near": {"tile_a,tile_b": [0, 12, -4]},
+        }
+    ]
+    cfg = parse(cfg_dict)
+    assert cfg.near_hint("tile_a,tile_b", 21) == (0, 12, -4)
+
+
+def test_near_hint_absent_for_the_name_returns_none(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 21, "shaped_peak": ["tile_a"]}]
+    cfg = parse(cfg_dict)
+    assert cfg.near_hint("tile_a", 21) is None
+
+
+def test_near_hint_wrong_timepoint_returns_none(cfg_dict, parse):
+    cfg_dict["overrides"] = [
+        {"at": 21, "shaped_peak": ["tile_a"], "near": {"tile_a": [1, 2, 3]}}
+    ]
+    cfg = parse(cfg_dict)
+    assert cfg.near_hint("tile_a", 22) is None
+
+
 # --- slices -------------------------------------------------------------------
 def test_slices_absent_is_full(cfg_dict, parse):
     assert parse(cfg_dict).slices == (slice(None),) * 3

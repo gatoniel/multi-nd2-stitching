@@ -77,6 +77,55 @@ def test_shaped_peak_pair_flags_either_order(cfg_dict, tmp_path, pair):
     assert [t.t for t in flagged] == [3]
 
 
+def test_near_hint_flows_to_time_task(cfg_dict, tmp_path):
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    cfg_dict["overrides"] = [
+        {"at": 4, "shaped_peak": ["tile_a"], "near": {"tile_a": [0, 5, -3]}}
+    ]
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    p = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+    flagged = next(t for t in p.time_tasks if t.t_to == 4)
+    assert flagged.near == (0, 5, -3)
+    assert all(t.near is None for t in p.time_tasks if t.t_to != 4)
+
+
+@pytest.mark.parametrize("pair", ["tile_a,tile_b", "tile_b,tile_a"])
+def test_near_hint_flows_to_pair_task_either_order(cfg_dict, tmp_path, pair):
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    cfg_dict["overrides"] = [
+        {"at": 3, "shaped_peak": [pair], "near": {pair: [1, -2, 3]}}
+    ]
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    p = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+    flagged = next(t for t in p.pair_tasks if t.t == 3)
+    assert flagged.near == (1, -2, 3)
+
+
+def test_near_hint_changes_the_key(plan):
+    """Same reasoning as shaped_peak: a different search needs a different slot."""
+    p, cfg, meta = plan
+    cfg2 = {
+        **cfg,
+        "overrides": [
+            {
+                "at": 3,
+                "shaped_peak": ["tile_a,tile_b"],
+                "near": {"tile_a,tile_b": [0, 4, -1]},
+            }
+        ],
+    }
+    q = build_plan(build(cfg2, n_files=2, nt=5, paths=cfg["files"]), meta)
+    hinted = next(t for t in q.pair_tasks if t.t == 3)
+    plain = next(t for t in p.pair_tasks if t.t == 3)
+    assert hinted.near is not None and plain.near is None
+    assert hinted.key != plain.key
+    others_p = {t.key for t in p.pair_tasks if t.t != 3}
+    others_q = {t.key for t in q.pair_tasks if t.t != 3}
+    assert others_p == others_q
+
+
 def test_shaped_peak_changes_the_key(plan):
     """The whole design: a different computation needs a different cache slot."""
     p, cfg, meta = plan

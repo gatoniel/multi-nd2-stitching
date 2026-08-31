@@ -122,6 +122,14 @@ def _check_overrides(cfg: StitchingConfig, p: list[str]) -> None:
             bad = sorted(n for n in parts if n not in known)
             if bad:
                 p.append(f"{where}.shaped_peak: unknown position(s) {bad} in '{entry}'")
+        for key, hint in o.near.items():
+            if key not in o.shaped_peak:
+                p.append(
+                    f"{where}.near: '{key}' has no matching shaped_peak entry "
+                    "in this block"
+                )
+            if len(hint) != 3 or not all(isinstance(v, int) for v in hint):
+                p.append(f"{where}.near['{key}']: must be [dz, dy, dx] (3 integers)")
         if not (o.names or o.shaped_peak):
             p.append(f"{where}: no drop/anchor/realign/shaped_peak, block does nothing")
         both = sorted(set(o.drop) & (set(o.anchor) | set(o.realign)))

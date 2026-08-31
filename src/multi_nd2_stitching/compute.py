@@ -22,6 +22,10 @@ PRECISION = {"float32": np.float32, "float64": np.float64}
 # artifact spike, not do a general search.
 SHAPED_PEAK_CANDIDATES = 25
 
+# Half-width (pixels) of the window searched around a `near` hint. Generous
+# on purpose -- the hint is "somewhere around here", not "exactly here".
+NEAR_SEARCH_RADIUS = 20
+
 
 def _neighbour_decay(inverse, idx: tuple) -> float:
     """How much `inverse` drops from `idx` to its neighbours, in the axis that
@@ -95,6 +99,30 @@ def _shaped_peak_index(inverse, candidates: int = SHAPED_PEAK_CANDIDATES) -> tup
     return max(candidate_peaks(inverse, candidates), key=lambda c: c.decay).index
 
 
+def _windowed_peak_index(
+    inverse, near_shift, radius: int = NEAR_SEARCH_RADIUS
+) -> tuple:
+    """argmax within a small cube around `near_shift` (a raw signed shift).
+
+    For the `near` override: instead of ranking candidates by shape at all,
+    trust the manual estimate and just look nearby. Wraps the same way the
+    response surface itself is circular, so a window near the edge behaves
+    like any other.
+    """
+    shape = inverse.shape
+    # The inverse of `to_signed_shift`: idx = (idx + half) % n - half = s
+    # rearranges to idx ≡ s (mod n) -- no `+half` here, that formula belongs
+    # to a different question (a raw idx's position in the *fftshifted*
+    # array, which inspect.py's candidates.csv uses instead).
+    centre = np.asarray(near_shift) % np.asarray(shape)
+    axes_idx = [
+        np.arange(c - radius, c + radius + 1) % n for c, n in zip(centre, shape)
+    ]
+    window = inverse[np.ix_(*axes_idx)]
+    local = np.unravel_index(np.argmax(window), window.shape)
+    return tuple(int(axes_idx[a][local[a]]) for a in range(3))
+
+
 def to_signed_shift(idx, shape) -> np.ndarray:
     """A raw array index -> a signed shift, wrapping arithmetically.
 
@@ -140,16 +168,23 @@ def correlation_surface(fft0, fft1, shape, workers: int = -1) -> np.ndarray:
     return spfft.irfftn(mult, s=shape, workers=workers, axes=list(range(fft0.ndim)))
 
 
-def phase_corr_from_ffts(fft0, fft1, shape, workers: int = -1, shaped: bool = False):
+def phase_corr_from_ffts(
+    fft0, fft1, shape, workers: int = -1, shaped: bool = False, near=None
+):
     """Cross-power spectrum -> peak, as a signed shift.
 
-    `shaped=True` (the `shaped_peak` override) picks the best-shaped point
-    among the top candidates instead of the single tallest one -- see
-    `_shaped_peak_index`. Default is the plain, unchanged `argmax`, so every
-    offset computed without the override is bit-for-bit what it always was.
+    `near` (a raw signed shift, the `near` override converted out of measured
+    space by the caller) restricts the search to a window around that point
+    -- see `_windowed_peak_index`. Without it, `shaped=True` (the
+    `shaped_peak` override) picks the best-shaped point among the top
+    candidates instead of the single tallest one -- see `_shaped_peak_index`.
+    Default is the plain, unchanged `argmax`, so every offset computed
+    without either override is bit-for-bit what it always was.
     """
     inverse = correlation_surface(fft0, fft1, shape, workers=workers)
-    if shaped:
+    if near is not None:
+        idx = _windowed_peak_index(inverse, near)
+    elif shaped:
         idx = _shaped_peak_index(inverse)
     else:
         idx = np.unravel_index(np.argmax(inverse), shape=shape)
@@ -231,8 +266,18 @@ def run_task(task, spectra, workers: int = -1) -> Offset:
     s0, s1 = task.spectrum_refs()
     fft0, shape = spectra.get(s0)
     fft1, _ = spectra.get(s1)
+
+    near = None
+    if task.near is not None:
+        # `near` is given in measured (final-offset) space; the search
+        # itself works in the raw space `PairTask.shift_px` hasn't been
+        # added into yet -- undo that here, the mirror of the `+=` below.
+        near = np.array(task.near, dtype=int)
+        if isinstance(task, PairTask):
+            near[task.axis] -= task.shift_px
+
     offset = phase_corr_from_ffts(
-        fft0, fft1, shape, workers=workers, shaped=task.shaped_peak
+        fft0, fft1, shape, workers=workers, shaped=task.shaped_peak, near=near
     )
     if isinstance(task, PairTask):
         offset[task.axis] += task.shift_px

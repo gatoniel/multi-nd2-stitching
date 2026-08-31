@@ -457,6 +457,9 @@ def test_inspect_candidates_csv_has_exactly_one_taken_row(project, tmp_path, cap
         "dz",
         "dy",
         "dx",
+        "px_z",
+        "px_y",
+        "px_x",
         "value",
         "decay",
         "taken",
@@ -467,6 +470,27 @@ def test_inspect_candidates_csv_has_exactly_one_taken_row(project, tmp_path, cap
     info = json.loads((d / "info.json").read_text())
     measured = tuple(info["measured_offset"])
     assert (int(taken[0]["dz"]), int(taken[0]["dy"]), int(taken[0]["dx"])) == measured
+
+
+def test_inspect_candidates_csv_pixel_positions_match_response_zarr(
+    project, tmp_path, capsys
+):
+    import csv
+
+    import numpy as np
+    import zarr
+
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "look"
+    assert run("inspect", project, "--at", 1, "--out", out) == 0
+    d = next((out / "t1").iterdir())
+    rows = list(csv.DictReader((d / "candidates.csv").open()))
+    response = zarr.open(str(d / "response.zarr"), mode="r")[:]
+
+    for row in rows:
+        px = (int(row["px_z"]), int(row["px_y"]), int(row["px_x"]))
+        assert response[px] == np.float32(float(row["value"]))
 
 
 def test_inspect_profiles_csv_covers_every_candidate_and_axis(project, tmp_path):
