@@ -159,7 +159,7 @@ def test_shaped_peak_at_holds_tile_names_and_pairs(cfg_dict, parse):
 
 
 def test_shaped_peak_is_not_part_of_names(cfg_dict, parse):
-    """It never changes graph membership -- unlike the other four verbs, it
+    """It never changes graph membership -- unlike the other three verbs, it
     must not show up in Override.names."""
     cfg_dict["overrides"] = [{"at": 5, "shaped_peak": ["tile_a,tile_b"]}]
     o = parse(cfg_dict).overrides[0]
@@ -178,6 +178,24 @@ def test_shaped_peak_coexists_with_other_verbs_in_one_block(cfg_dict, parse):
     cfg = parse(cfg_dict)
     assert cfg.dropped_at(5) == {"tile_b"}
     assert cfg.shaped_peak_at(5) == {"tile_a"}
+
+
+# --- realign: tile-name and 'a,b' pair forms, same convention as shaped_peak --
+def test_realigned_at_holds_tile_names_and_pairs(cfg_dict, parse):
+    cfg_dict["overrides"] = [
+        {"at": 21, "realign": ["tile_a", "tile_a,tile_b"]},
+    ]
+    cfg = parse(cfg_dict)
+    assert cfg.realigned_at(21) == {"tile_a", "tile_a,tile_b"}
+    assert cfg.realigned_at(22) == set()
+
+
+def test_realign_is_not_part_of_names(cfg_dict, parse):
+    """Recomputing with a different crop doesn't change graph membership
+    either -- same reasoning as shaped_peak, so realign is excluded too."""
+    cfg_dict["overrides"] = [{"at": 5, "realign": ["tile_a,tile_b"]}]
+    o = parse(cfg_dict).overrides[0]
+    assert o.names == set()
 
 
 # --- near: a rough manual estimate attached to a shaped_peak entry ------------

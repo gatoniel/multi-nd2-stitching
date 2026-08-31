@@ -56,6 +56,64 @@ def test_realign_flag_and_crop(cfg_dict, tmp_path):
     assert next(t for t in p.time_tasks if not t.realign).crop.z == (0, 20)
 
 
+@pytest.mark.parametrize("pair", ["tile_a,tile_b", "tile_b,tile_a"])
+def test_realign_pair_flags_either_order(cfg_dict, tmp_path, pair):
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    cfg_dict["realignment_slices"] = {"y": [100, 200]}
+    cfg_dict["overrides"] = [{"at": 3, "realign": [pair]}]
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    p = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+    flagged = [t for t in p.pair_tasks if t.realign]
+    assert [t.t for t in flagged] == [3]
+
+
+def test_realign_pair_frees_its_own_axis_regardless_of_realignment_slices(
+    cfg_dict, tmp_path
+):
+    """The correction this whole feature exists for: realignment_slices must
+    never restrict the axis actually being correlated, even though it's free
+    to restrict z and the *other* lateral axis."""
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    cfg_dict["slices"] = {"z": [0, 20]}
+    cfg_dict["realignment_slices"] = {"z": [5, 15], "y": [100, 200]}
+    cfg_dict["overrides"] = [{"at": 3, "realign": ["tile_a,tile_b"]}]
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    p = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+
+    realigned = next(t for t in p.pair_tasks if t.realign)
+    assert realigned.axis == 2  # the default line is along x
+    assert realigned.crop.z == (5, 15)
+    assert realigned.crop.y == (100, 200)
+    assert realigned.crop.x == (None, None)  # its own axis: always freed
+
+    plain = next(t for t in p.pair_tasks if not t.realign)
+    assert plain.crop.z == (0, 20)
+    assert plain.crop.y == (None, None)  # `slices` never touched y
+    assert plain.crop.x == (None, None)
+
+
+def test_realign_pair_changes_the_key_via_the_crop(plan):
+    """Unlike shaped_peak/near, `realign` itself isn't in PairTask.key() --
+    it doesn't need to be: a real realignment_slices always changes the crop,
+    and the crop is already part of the key (same as TimeTask)."""
+    p, cfg, meta = plan
+    cfg2 = {
+        **cfg,
+        "realignment_slices": {"y": [1, 2]},
+        "overrides": [{"at": 3, "realign": ["tile_a,tile_b"]}],
+    }
+    q = build_plan(build(cfg2, n_files=2, nt=5, paths=cfg["files"]), meta)
+    realigned = next(t for t in q.pair_tasks if t.t == 3)
+    plain = next(t for t in p.pair_tasks if t.t == 3)
+    assert realigned.realign and not plain.realign
+    assert realigned.key != plain.key
+    others_p = {t.key for t in p.pair_tasks if t.t != 3}
+    others_q = {t.key for t in q.pair_tasks if t.t != 3}
+    assert others_p == others_q
+
+
 def test_shaped_peak_tile_name_flags_only_that_timepoint(cfg_dict, tmp_path):
     files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files

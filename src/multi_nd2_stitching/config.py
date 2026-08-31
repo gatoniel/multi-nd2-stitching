@@ -102,7 +102,9 @@ class Override:
                    t-1 -- it hangs off a neighbour instead
       anchor       the tile is placed by drifting from t-1, in addition to
                    whatever reference_in_files says
-      realign      recompute this tile's drift step using realignment_slices
+      realign      recompute using realignment_slices instead of slices --
+                   a bare tile name (its drift step) or an "a,b" pair (a
+                   neighbour correlation, same convention as shaped_peak)
       shaped_peak  pick the correlation peak by shape instead of raw height --
                    see StitchingConfig.shaped_peak_at
 
@@ -113,9 +115,11 @@ class Override:
 
     `shaped_peak` entries name either a bare tile name (a drift step) or an
     `"a,b"` pair (a neighbour correlation, the same convention `stitch inspect
-    --pair` uses) -- unlike the other four verbs, it never changes which tiles
+    --pair` uses) -- unlike the other three verbs, it never changes which tiles
     exist or how they're connected, only how one correlation's peak is picked,
-    so it is deliberately not part of `names`.
+    so it is deliberately not part of `names`. `realign` names either form too,
+    for the identical reason: recomputing with a different crop doesn't change
+    graph membership either, so it is also excluded from `names`.
 
     `near` gives a rough manual estimate of the true offset for a
     `shaped_peak` entry -- `{"a,b": [dz, dy, dx]}`, in the same units already
@@ -140,9 +144,7 @@ class Override:
 
     @property
     def names(self) -> set[str]:
-        return (
-            set(self.drop) | set(self.unanchor) | set(self.anchor) | set(self.realign)
-        )
+        return set(self.drop) | set(self.unanchor) | set(self.anchor)
 
 
 @attrs.define(kw_only=True)

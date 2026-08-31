@@ -5,7 +5,7 @@ from helpers import build, grid_meta, make_meta, stub_files
 
 from multi_nd2_stitching.config import loads_config
 from multi_nd2_stitching.layout import build_layout
-from multi_nd2_stitching.validate import check_layout, check_shaped_peak
+from multi_nd2_stitching.validate import check_layout, check_realign, check_shaped_peak
 
 # A 2x2 grid, one step = 55um, same spacing test_placement.py's SQUARE uses.
 SQUARE = {"a": (0.0, 0.0), "b": (55.0, 0.0), "c": (0.0, 55.0), "d": (55.0, 55.0)}
@@ -367,6 +367,70 @@ def test_shaped_peak_pair_dead_ranges_are_collapsed_in_the_message(cfg_dict):
     ]
     problems = check_shaped_peak(build(cfg_dict))
     assert any("t=3-5, 8" in p for p in problems), problems
+
+
+# --- realign pairs ----------------------------------------------------------
+# Realignment_slices must differ from slices on the pair's *other* lateral
+# axis (y, here -- the default line is along x) so the axis-aware no-op
+# check (below) doesn't fire and contaminate the "this part is fine" cases.
+_REALIGN_DIFFERS = {"y": [1, 2]}
+
+
+def test_realign_pair_alive_throughout_is_fine(cfg_dict):
+    cfg_dict["realignment_slices"] = _REALIGN_DIFFERS
+    cfg_dict["overrides"] = [{"at": 3, "realign": ["tile_a,tile_b"]}]
+    assert check_realign(build(cfg_dict)) == []
+
+
+def test_realign_pair_reversed_order_is_fine(cfg_dict):
+    cfg_dict["realignment_slices"] = _REALIGN_DIFFERS
+    cfg_dict["overrides"] = [{"at": 3, "realign": ["tile_b,tile_a"]}]
+    assert check_realign(build(cfg_dict)) == []
+
+
+def test_realign_bare_tile_name_is_not_this_checks_concern(cfg_dict):
+    cfg_dict["overrides"] = [{"at": 3, "realign": ["tile_a"]}]
+    assert check_realign(build(cfg_dict)) == []
+
+
+def test_realign_flags_a_pair_that_never_exists(cfg_dict):
+    cfg_dict["positions"] = {
+        "a": {"start": [0, 0], "reference_in_files": [0, 1]},
+        "a1": {"start": [0, 0]},
+        "a2": {"start": [0, 0]},
+    }
+    cfg_dict["realignment_slices"] = _REALIGN_DIFFERS
+    cfg_dict["overrides"] = [{"at": 3, "realign": ["a,a2"]}]
+    problems = check_realign(build(cfg_dict, tiles=("a", "a1", "a2")))
+    assert any("not a discovered neighbour pair" in p for p in problems), problems
+
+
+def test_realign_flags_a_pair_not_alive_at_that_time(cfg_dict):
+    cfg_dict["realignment_slices"] = _REALIGN_DIFFERS
+    cfg_dict["overrides"] = [
+        {"at": 3, "drop": ["tile_b"], "realign": ["tile_a,tile_b"]}
+    ]
+    problems = check_realign(build(cfg_dict))
+    assert any("not alive at t=3" in p for p in problems), problems
+
+
+def test_realign_pair_flags_when_only_its_own_axis_differs(cfg_dict):
+    """The addition specific to realign: realignment_slices differs from
+    slices only along the pair's own (always-freed) axis, so the crop
+    realign actually uses is identical to the plain one -- a silent no-op
+    _check_realign's whole-volume comparison can't see."""
+    cfg_dict["slices"] = {"x": [0, 10]}
+    cfg_dict["realignment_slices"] = {"x": [5, 15]}  # differs only on x
+    cfg_dict["overrides"] = [{"at": 3, "realign": ["tile_a,tile_b"]}]
+    problems = check_realign(build(cfg_dict))
+    assert any("always freed for a pair" in p for p in problems), problems
+
+
+def test_realign_pair_is_fine_when_the_other_axis_differs(cfg_dict):
+    cfg_dict["slices"] = {"x": [0, 10]}
+    cfg_dict["realignment_slices"] = {"x": [5, 15], **_REALIGN_DIFFERS}
+    cfg_dict["overrides"] = [{"at": 3, "realign": ["tile_a,tile_b"]}]
+    assert check_realign(build(cfg_dict)) == []
 
 
 # --- sanity -------------------------------------------------------------------

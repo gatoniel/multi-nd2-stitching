@@ -84,7 +84,10 @@ traversal order. Those are flagged, never silently resolved.
 
 **The blend crop must not touch the correlation axis.** `crop_for_alignment`
 owns that axis; cropping it removes the overlap strip the correlation needs.
-See `Crop.free_axis`.
+See `Crop.free_axis`. This holds for *either* crop a `PairTask` can use --
+`build_plan` applies `.free_axis` after picking `realignment_slices` or
+`slices`, not before, so a `realign` pair is never accidentally starved of
+its own overlap strip.
 
 **A diagonal neighbour never gets an edge `Pair`.** Two tiles can overlap
 across a corner (one grid step away in both y and x) with no third tile

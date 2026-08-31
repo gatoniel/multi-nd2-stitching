@@ -17,7 +17,7 @@ from .layout import build_layout
 from .metadata import load_metadata
 from .offsets import PairTask, build_plan, file_keys
 from .store import OffsetStore
-from .validate import check, check_layout, check_shaped_peak
+from .validate import check, check_layout, check_realign, check_shaped_peak
 from .workspace import Workspace
 
 
@@ -45,7 +45,10 @@ def _prepare(args, *, need_metadata: bool):
     meta = load_metadata(cfg.files, cache=ws.metadata)
     layout = build_layout(cfg, meta)
     _report(
-        check(cfg, nts=meta.nts) + check_layout(layout) + check_shaped_peak(layout),
+        check(cfg, nts=meta.nts)
+        + check_layout(layout)
+        + check_shaped_peak(layout)
+        + check_realign(layout),
         str(args.config),
     )
     return ws, cfg, meta, layout

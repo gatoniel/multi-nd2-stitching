@@ -144,6 +144,7 @@ class PairTask:
     precision: str = "float32"
     shaped_peak: bool = False
     near: tuple[int, int, int] | None = None
+    realign: bool = False
 
     kind = "pair"
 
@@ -174,7 +175,8 @@ class PairTask:
         )
 
     def describe(self) -> str:
-        tag = " (shaped)" if self.shaped_peak else ""
+        tag = " (realign)" if self.realign else ""
+        tag += " (shaped)" if self.shaped_peak else ""
         return f"pair {self.a}|{self.b} axis={self.axis} t={self.t}{tag}"
 
 
@@ -296,7 +298,9 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
     pair_tasks = []
     for t in range(layout.nt):
         shaped_at_t = cfg.shaped_peak_at(t)
+        realign_at_t = cfg.realigned_at(t)
         for p in layout.pairs_at(t):
+            realign = f"{p.a},{p.b}" in realign_at_t or f"{p.b},{p.a}" in realign_at_t
             pair_tasks.append(
                 PairTask(
                     a=p.a,
@@ -305,7 +309,7 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                     t=t,
                     src=ref(p.a, t),
                     dst=ref(p.b, t),
-                    crop=crop.free_axis(p.axis),
+                    crop=(realign_crop if realign else crop).free_axis(p.axis),
                     shift_px=layout.shift_px,
                     precision=precision,
                     shaped_peak=(
@@ -315,6 +319,7 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                         cfg.near_hint(f"{p.a},{p.b}", t)
                         or cfg.near_hint(f"{p.b},{p.a}", t)
                     ),
+                    realign=realign,
                 )
             )
 

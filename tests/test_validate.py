@@ -84,6 +84,10 @@ def test_detects_problem(cfg_dict, parse, mutate, fragment):
         ({"at": 5, "shaped_peak": ["nope"]}, "unknown position"),
         ({"at": 5, "shaped_peak": ["tile_a,nope"]}, "unknown position"),
         ({"at": 5, "shaped_peak": ["a,b,c"]}, "tile name or an 'a,b' pair"),
+        # realign, pair form
+        ({"at": 5, "realign": ["nope"]}, "unknown position"),
+        ({"at": 5, "realign": ["tile_a,nope"]}, "unknown position"),
+        ({"at": 5, "realign": ["a,b,c"]}, "tile name or an 'a,b' pair"),
         # near
         ({"at": 5, "near": {"tile_a": [0, 1, 2]}}, "no matching shaped_peak entry"),
         (
@@ -123,6 +127,27 @@ def test_shaped_peak_with_a_matching_near_hint_is_fine(cfg_dict, parse):
         }
     ]
     assert check(parse(cfg_dict)) == []
+
+
+# --- realign, pair form ----------------------------------------------------
+def test_realign_pair_only_block_is_not_a_no_op(cfg_dict, parse):
+    cfg_dict["realignment_slices"] = {"y": [1, 2]}
+    cfg_dict["overrides"] = [{"at": 5, "realign": ["tile_a,tile_b"]}]
+    assert check(parse(cfg_dict)) == []
+
+
+def test_realign_pair_at_t0_has_no_predecessor_requirement(cfg_dict, parse):
+    """Unlike a drift step, a pair correlation at t=0 needs no t-1 -- the
+    'no predecessor' check must not fire for the pair form."""
+    cfg_dict["realignment_slices"] = {"y": [1, 2]}
+    cfg_dict["overrides"] = [{"at": 0, "realign": ["tile_a,tile_b"]}]
+    assert check(parse(cfg_dict)) == []
+
+
+def test_realign_still_flags_a_bare_name_at_t0(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 0, "realign": ["tile_a"]}]
+    problems = check(parse(cfg_dict))
+    assert any("no predecessor" in p for p in problems), problems
 
 
 def test_duplicate_timepoint_across_overrides(cfg_dict, parse):

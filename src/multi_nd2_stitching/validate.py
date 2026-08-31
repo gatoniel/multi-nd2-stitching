@@ -122,6 +122,16 @@ def _check_overrides(cfg: StitchingConfig, p: list[str]) -> None:
             bad = sorted(n for n in parts if n not in known)
             if bad:
                 p.append(f"{where}.shaped_peak: unknown position(s) {bad} in '{entry}'")
+        for entry in o.realign:
+            parts = entry.split(",")
+            if len(parts) not in (1, 2):
+                p.append(
+                    f"{where}.realign: '{entry}' must be a tile name or an 'a,b' pair"
+                )
+                continue
+            bad = sorted(n for n in parts if n not in known)
+            if bad:
+                p.append(f"{where}.realign: unknown position(s) {bad} in '{entry}'")
         for key, hint in o.near.items():
             if key not in o.shaped_peak:
                 p.append(
@@ -130,7 +140,7 @@ def _check_overrides(cfg: StitchingConfig, p: list[str]) -> None:
                 )
             if len(hint) != 3 or not all(isinstance(v, int) for v in hint):
                 p.append(f"{where}.near['{key}']: must be [dz, dy, dx] (3 integers)")
-        if not (o.names or o.shaped_peak):
+        if not (o.names or o.shaped_peak or o.realign):
             p.append(f"{where}: no drop/anchor/realign/shaped_peak, block does nothing")
         both = sorted(set(o.drop) & (set(o.anchor) | set(o.realign)))
         if both:
@@ -144,7 +154,8 @@ def _check_overrides(cfg: StitchingConfig, p: list[str]) -> None:
                 f"{where}: {redundant} unanchored and dropped; dropping already "
                 "removes the anchor, so the unanchor does nothing"
             )
-        if 0 in o.at and o.realign:
+        bare_realign = [n for n in o.realign if "," not in n]
+        if 0 in o.at and bare_realign:
             p.append(f"{where}: realign at t=0, which has no predecessor")
         # The coupling this schema exists to make visible.
         dropped_refs = [
@@ -327,31 +338,73 @@ def check_layout(layout) -> list[str]:
     return p
 
 
-def check_shaped_peak(layout) -> list[str]:
-    """A shaped_peak pair override must name a pair that is actually there.
+_AXIS_NAME = ("z", "y", "x")
+
+
+def _check_pair_overrides(layout, verb: str, get_entries) -> list[str]:
+    """Shared by check_shaped_peak and check_realign: a pair-form entry
+    ('a,b') must name a pair that is actually there.
 
     'a,b' names an edge in the discovered neighbour graph, not two arbitrary
     tile names -- config-tier validation can only check that both names are
     known positions (`_check_overrides`), not whether they ever pair up or
     are alive together at the timepoint given. If they aren't, there is no
     PairTask for the override to attach to: `build_plan` simply never sets
-    `shaped_peak=True` anywhere, and the override silently does nothing.
+    the verb's flag anywhere, and the override silently does nothing.
     """
     p: list[str] = []
     pair_index = {frozenset((pr.a, pr.b)): k for k, pr in enumerate(layout.pairs)}
     for o in layout.config.overrides:
-        for entry in o.shaped_peak:
+        for entry in get_entries(o):
             parts = entry.split(",")
             if len(parts) != 2:
                 continue  # a bare tile name -- not this check's concern
             k = pair_index.get(frozenset(parts))
             if k is None:
-                p.append(f"shaped_peak: '{entry}' is not a discovered neighbour pair")
+                p.append(f"{verb}: '{entry}' is not a discovered neighbour pair")
                 continue
             dead = [t for t in o.at if not layout.pair_alive[t, k]]
             if dead:
                 p.append(
-                    f"shaped_peak: '{entry}' is not alive at t={_ranges(dead)}; "
+                    f"{verb}: '{entry}' is not alive at t={_ranges(dead)}; "
                     "this override has nothing to attach to there"
+                )
+    return p
+
+
+def check_shaped_peak(layout) -> list[str]:
+    """A shaped_peak pair override must name a pair that is actually there --
+    see `_check_pair_overrides`."""
+    return _check_pair_overrides(layout, "shaped_peak", lambda o: o.shaped_peak)
+
+
+def check_realign(layout) -> list[str]:
+    """A realign pair override must name a pair that is actually there (see
+    `_check_pair_overrides`) -- plus one thing specific to `realign`: a
+    pair's own correlation axis is always freed (`build_plan` frees it the
+    same way for both the normal and the realigned crop), so if
+    `realignment_slices` differs from `slices` *only* along that pair's own
+    axis, the freed crop `realign` produces is identical to the normal one.
+    `_check_realign` (tier 1) can't see this -- it compares the whole
+    volumes, not per pair -- so it belongs here, where each pair's axis is
+    known.
+    """
+    p = _check_pair_overrides(layout, "realign", lambda o: o.realign)
+    cfg = layout.config
+    pair_index = {frozenset((pr.a, pr.b)): pr for pr in layout.pairs}
+    for o in cfg.overrides:
+        for entry in o.realign:
+            parts = entry.split(",")
+            if len(parts) != 2:
+                continue  # a bare tile name -- not this check's concern
+            pr = pair_index.get(frozenset(parts))
+            if pr is None:
+                continue  # already reported above
+            other_axes = [a for a in range(3) if a != pr.axis]
+            if all(cfg.slices[a] == cfg.realignment_slices[a] for a in other_axes):
+                p.append(
+                    f"realign: '{entry}' only differs from slices along its own "
+                    f"axis ({_AXIS_NAME[pr.axis]}), which is always freed for a "
+                    "pair -- this recomputes to the identical crop"
                 )
     return p

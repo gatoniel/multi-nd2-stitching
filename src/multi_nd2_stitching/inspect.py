@@ -138,6 +138,7 @@ def inspect_pair(
                 },
                 "measured_offset": [int(v) for v in measured],
                 "shaped_peak": task.shaped_peak,
+                "realign": task.realign,
                 "tile_shape": [int(v) for v in tile_shape],
                 "strip_shape": [int(v) for v in strip_a.shape],
             },

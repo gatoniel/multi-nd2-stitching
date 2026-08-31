@@ -446,6 +446,25 @@ def test_inspect_writes_arrays_napari_can_open(project, tmp_path, capsys):
     assert info["t"] == 1 and len(info["measured_offset"]) == 3
 
 
+def test_inspect_pair_info_json_reports_realign(project, tmp_path, capsys):
+    import json
+
+    cfg = yaml.safe_load(project.read_text())
+    cfg["realignment_slices"] = {"y": [1, 2]}
+    cfg["overrides"] = [{"at": 1, "realign": ["tile_a,tile_b"]}]
+    project.write_text(yaml.safe_dump(cfg))
+
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    out = tmp_path / "look"
+    assert (
+        run("inspect", project, "--at", 1, "--pair", "tile_a,tile_b", "--out", out) == 0
+    )
+    d = next((out / "t1").iterdir())
+    info = json.loads((d / "info.json").read_text())
+    assert info["realign"] is True
+
+
 def test_inspect_candidates_csv_has_exactly_one_taken_row(project, tmp_path, capsys):
     import csv
     import json
@@ -913,6 +932,34 @@ def test_validate_deep_flags_a_shaped_peak_pair_not_alive(project, capsys):
 def test_validate_deep_is_fine_with_a_live_shaped_peak_pair(project, capsys):
     cfg = yaml.safe_load(project.read_text())
     cfg["overrides"] = [{"at": 3, "shaped_peak": ["tile_a,tile_b"]}]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("validate", project, "--deep") == 0
+
+
+def test_validate_deep_flags_a_realign_pair_not_alive(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["realignment_slices"] = {"y": [1, 2]}
+    cfg["overrides"] = [{"at": 3, "drop": ["tile_b"], "realign": ["tile_a,tile_b"]}]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("validate", project, "--deep") == 1
+    assert "not alive at t=3" in capsys.readouterr().err
+
+
+def test_validate_deep_flags_a_realign_pair_that_only_frees_its_own_axis(
+    project, capsys
+):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["realignment_slices"] = {"x": [5, 15]}  # x is the pair's own axis here
+    cfg["overrides"] = [{"at": 3, "realign": ["tile_a,tile_b"]}]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("validate", project, "--deep") == 1
+    assert "always freed for a pair" in capsys.readouterr().err
+
+
+def test_validate_deep_is_fine_with_a_live_realign_pair(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["realignment_slices"] = {"y": [1, 2]}
+    cfg["overrides"] = [{"at": 3, "realign": ["tile_a,tile_b"]}]
     project.write_text(yaml.safe_dump(cfg))
     assert run("validate", project, "--deep") == 0
 
