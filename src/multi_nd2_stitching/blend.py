@@ -200,6 +200,14 @@ def _weights_key(name, t, coords, pairs, corners, tile_shape):
     return (tile_shape, tuple(sorted(parts)), tuple(sorted(corner_parts)))
 
 
+# Every ramp -- edge or corner -- spans this range, never quite reaching 0 or
+# 1: a voxel right at a tile's own edge still gets *some* weight (so a solo
+# region at the very edge isn't zeroed by a rounding fluke) and the far end
+# still yields a little to a neighbour rather than snapping to a hard 1.0.
+RAMP_MIN = 0.01
+RAMP_MAX = 0.99
+
+
 def _corner_taper(dy: int, dx: int, tile_shape):
     """The 2D ramp for one diagonal neighbour, and where it lands.
 
@@ -222,8 +230,8 @@ def _corner_taper(dy: int, dx: int, tile_shape):
     ox = abs(dx)
     if not (0 < oy < tile_shape[1] and 0 < ox < tile_shape[2]):
         return None  # degenerate placement; leave this corner flat
-    ry = np.linspace(0.01, 0.99, oy, dtype=np.float32)
-    rx = np.linspace(0.01, 0.99, ox, dtype=np.float32)
+    ry = np.linspace(RAMP_MIN, RAMP_MAX, oy, dtype=np.float32)
+    rx = np.linspace(RAMP_MIN, RAMP_MAX, ox, dtype=np.float32)
     if dy > 0:  # neighbour is below -- name's *bottom* band faces it
         ry = ry[::-1]
         y_sl = slice(tile_shape[1] - oy, tile_shape[1])
@@ -238,7 +246,7 @@ def _corner_taper(dy: int, dx: int, tile_shape):
 
 
 # Divisor floor for uncovered voxels. Must stay far below the float32 ulp of
-# the smallest ramp weight (0.01, ulp ~1e-9) so it perturbs nothing real.
+# the smallest ramp weight (RAMP_MIN, ulp ~1e-9) so it perturbs nothing real.
 EPS = 1e-12
 
 WEIGHTS_CACHE_MAX = 24
@@ -281,7 +289,7 @@ def blend_weights(name, t, coords: Coordinates, pairs, corners, tile_shape, cach
         length = int((here[pair.b] - here[pair.a])[pair.axis])
         if not 0 < length < tile_shape[pair.axis]:
             continue  # degenerate placement; leave this edge flat
-        ramp = np.linspace(0.01, 0.99, length, dtype=np.float32)
+        ramp = np.linspace(RAMP_MIN, RAMP_MAX, length, dtype=np.float32)
         if pair.a == name:
             w[pair.axis - 1][-length:] = ramp[::-1]
         else:
@@ -443,11 +451,11 @@ def compose_timepoint(
     }
     for za, zb, covering in z_segments(local_boxes, shape[0]):
         # Seed with the floor rather than zeroing and clamping afterwards. Any
-        # weight a tile contributes is at least 0.01, whose float32 ulp is ~1e-9,
-        # so EPS is far below the rounding of every covered voxel and adds
-        # nothing to them. Uncovered voxels keep EPS, and their accum is exactly
-        # zero, so the divide yields zero rather than 0/0. One pass over the
-        # plane instead of three.
+        # weight a tile contributes is at least RAMP_MIN, whose float32 ulp is
+        # ~1e-9, so EPS is far below the rounding of every covered voxel and
+        # adds nothing to them. Uncovered voxels keep EPS, and their accum is
+        # exactly zero, so the divide yields zero rather than 0/0. One pass
+        # over the plane instead of three.
         plane.fill(EPS)
         for name in covering:
             _, y0, x0 = placed[name]
