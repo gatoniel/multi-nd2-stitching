@@ -13,7 +13,7 @@ from multi_nd2_stitching.compute import (
     run_task,
     to_signed_shift,
 )
-from multi_nd2_stitching.offsets import Crop, PairTask, TimeTask, VolumeRef
+from multi_nd2_stitching.offsets import CornerTask, Crop, PairTask, TimeTask, VolumeRef
 from multi_nd2_stitching.store import Offset, OffsetStore
 
 
@@ -428,6 +428,23 @@ def test_run_task_near_none_passes_none_through(monkeypatch):
     )
     run_task(task, Spectra(FakeReader()))
     assert captured["near"] is None
+
+
+def test_corner_task_recovers_a_known_offset():
+    """No axis, no shift_px addition -- the raw 3-component offset comes
+    back directly, same as a TimeTask's drift step."""
+    src, dst = _refs()
+    reader = FakeReader(shifts={dst: (0, 4, -6)})
+    task = CornerTask(
+        a="a",
+        b="b",
+        t=0,
+        src=src,
+        dst=dst,
+        crop_a=Crop((None, None), (None, None), (None, None)),
+        crop_b=Crop((None, None), (None, None), (None, None)),
+    )
+    assert run_task(task, Spectra(reader)) == Offset(0, -4, 6)
 
 
 def test_unknown_task_type_is_loud():

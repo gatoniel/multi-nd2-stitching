@@ -103,6 +103,19 @@ class Layout:
         return file_i, pos
 
 
+def _canvas_after(stage_delta: float, flip: bool) -> bool:
+    """Is the point this delta was measured *from* canvas-positioned after
+    the point it's relative *to*, along one axis? (`stage_delta = here[source]
+    - here[ref]`.) Mirrors exactly the rule `_discover_pairs` already uses to
+    decide `Pair.a`/`.b`: unflipped, a *smaller* raw stage delta means
+    canvas-after (proven by `coordinates.py`: `Pair.b` is always canvas-after
+    `Pair.a`, and `_discover_pairs` picks whichever tile has the *larger* raw
+    stage coordinate as `a`). `flip_x`/`flip_y` each invert that for their own
+    axis, which is the entire reason they exist.
+    """
+    return (stage_delta < 0) != flip
+
+
 def _discover_pairs(
     cfg: StitchingConfig, meta: Metadata, tile: dict[str, Tile]
 ) -> tuple[Pair, ...]:
@@ -167,6 +180,34 @@ def _discover_corners(
     return tuple(sorted(found))
 
 
+def corner_direction(
+    cfg: StitchingConfig, meta: Metadata, tile: dict[str, Tile], a: str, b: str
+) -> tuple[int, int]:
+    """Nominal canvas (dy_sign, dx_sign) of `b` relative to `a`, from stage
+    coordinates alone.
+
+    `blend.py`'s corner taper can read the real, drifted offset out of
+    `coords.at(t)` because both tiles are already placed by blend time. This
+    is for the opposite situation -- building a `CornerTask`'s *crop*, before
+    either tile necessarily has a coordinate at all (that's the point of
+    fitting a corner: there is no other route yet) -- so it has to come from
+    the nominal grid instead, the same way `_discover_pairs` already fixes a
+    `Pair`'s direction from `flip_x`/`flip_y`. `Corner.a`/`.b` themselves stay
+    untouched (still just sorted names -- blend.py doesn't need this and
+    nothing else should start depending on a direction baked in there).
+    """
+    for file_i, fm in enumerate(meta.files):
+        pa, pb = tile[a].position[file_i], tile[b].position[file_i]
+        if pa is None or pb is None:
+            continue
+        dx, dy = np.array(fm.stage_um[pb]) - np.array(fm.stage_um[pa])
+        return (
+            1 if _canvas_after(dy, cfg.flip_y) else -1,
+            1 if _canvas_after(dx, cfg.flip_x) else -1,
+        )
+    raise ValueError(f"'{a}' and '{b}' are never both alive in the same file")
+
+
 def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
     n_files = len(meta)
     if n_files != cfg.n_files:
@@ -209,7 +250,9 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
                 )
         position = tuple(
             (
-                pos.position_in_files[i]
+                None
+                if i in pos.missing_in_files
+                else pos.position_in_files[i]
                 if i in pos.position_in_files
                 else meta[i].position_of(names)
             )
@@ -217,7 +260,11 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
             else None
             for i in range(n_files)
         )
-        missing = [i for i in range(pos.start[0], end_file) if position[i] is None]
+        missing = [
+            i
+            for i in range(pos.start[0], end_file)
+            if position[i] is None and i not in pos.missing_in_files
+        ]
         if missing:
             raise ValueError(
                 f"'{name}' should be alive in files {pos.start[0]}..{end_file - 1} "
@@ -251,6 +298,10 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
     is_anchor = np.zeros((nt, len(tiles)), dtype=bool)
     for i, name in enumerate(tiles):
         tile_alive[tile[name].first_t : tile[name].last_t, i] = True
+        # A gap cut out of that otherwise-contiguous range -- the tile can be
+        # alive again in a later file, so this is not the same as end.
+        for f in cfg.positions[name].missing_in_files:
+            tile_alive[file_start[f] : file_start[f] + nts[f], i] = False
         for f in cfg.positions[name].reference_in_files:
             is_anchor[file_start[f] : file_start[f] + nts[f], i] = True
 

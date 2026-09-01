@@ -15,7 +15,7 @@ import json
 import attrs
 
 from .config import clamp_z
-from .layout import Layout
+from .layout import Layout, corner_direction
 from .metadata import FileStamp, Metadata
 
 _AXIS_NAME = {0: "z", 1: "y", 2: "x"}
@@ -181,9 +181,56 @@ class PairTask:
 
 
 @attrs.frozen
+class CornerTask:
+    """Offset between two diagonally-adjacent tiles at one global timepoint.
+
+    Unlike `PairTask`, there is no correlation axis to free -- a diagonal
+    pair only overlaps a small rectangle near the corner (the same one
+    `blend.py::_corner_taper` tapers for), not a full-length edge strip, so
+    both `crop_a` and `crop_b` restrict *both* lateral axes down to roughly
+    that rectangle, one crop per tile since each tile's own corner sits on
+    the opposite side of it.
+    """
+
+    a: str
+    b: str
+    t: int
+    src: VolumeRef
+    dst: VolumeRef
+    crop_a: Crop
+    crop_b: Crop
+    precision: str = "float32"
+
+    kind = "corner"
+
+    @property
+    def key(self) -> str:
+        return _digest(
+            [
+                "corner",
+                self.src.key(),
+                self.dst.key(),
+                self.crop_a.key(),
+                self.crop_b.key(),
+                self.precision,
+            ]
+        )
+
+    def spectrum_refs(self) -> tuple[SpectrumRef, SpectrumRef]:
+        return (
+            SpectrumRef(self.src, self.crop_a, self.precision),
+            SpectrumRef(self.dst, self.crop_b, self.precision),
+        )
+
+    def describe(self) -> str:
+        return f"corner {self.a}|{self.b} t={self.t}"
+
+
+@attrs.frozen
 class Plan:
     time_tasks: tuple[TimeTask, ...]
     pair_tasks: tuple[PairTask, ...]
+    corner_tasks: tuple[CornerTask, ...] = ()
 
     @property
     def tasks(self) -> tuple:
@@ -193,11 +240,12 @@ class Plan:
         by the time tasks at t and t+1. Grouping by timepoint bounds the working
         set at roughly two timepoints, which is what makes VolumeCache viable.
         Running all time tasks before all pair tasks would evict and re-read
-        every volume twice.
+        every volume twice. Corner tasks sort with pair tasks -- same reasoning,
+        both correlate already-alive tiles at t rather than driving t forward.
         """
         return tuple(
             sorted(
-                self.time_tasks + self.pair_tasks,
+                self.time_tasks + self.pair_tasks + self.corner_tasks,
                 key=lambda x: (
                     x.t_to if isinstance(x, TimeTask) else x.t,
                     0 if isinstance(x, TimeTask) else 1,
@@ -253,11 +301,29 @@ class Plan:
         return Plan(
             time_tasks=tuple(x for x in self.time_tasks if t0 <= x.t_to < t1),
             pair_tasks=tuple(x for x in self.pair_tasks if t0 <= x.t < t1),
+            corner_tasks=tuple(x for x in self.corner_tasks if t0 <= x.t < t1),
         )
 
 
 def file_keys(meta: Metadata) -> tuple[str, ...]:
     return tuple(_digest(attrs.asdict(FileStamp.of(f.path))) for f in meta.files)
+
+
+def _corner_crop(cfg, layout, meta, a: str, b: str, base: Crop) -> tuple[Crop, Crop]:
+    """`a`'s and `b`'s own crops for a CornerTask: each tile's own
+    `shift_px`-by-`shift_px` corner block, in the nominal direction of the
+    other -- the diagonal analogue of `crop.free_axis`, except here neither
+    axis can be freed (see `CornerTask`'s docstring), both are cropped down.
+    """
+    dy_sign, dx_sign = corner_direction(cfg, meta, layout.tile, a, b)
+    ny, nx, s = layout.ny, layout.nx, layout.shift_px
+
+    def side(sign: int, extent: int) -> tuple[int, int]:
+        return (extent - s, extent) if sign > 0 else (0, s)
+
+    crop_a = attrs.evolve(base, y=side(dy_sign, ny), x=side(dx_sign, nx))
+    crop_b = attrs.evolve(base, y=side(-dy_sign, ny), x=side(-dx_sign, nx))
+    return crop_a, crop_b
 
 
 def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Plan:
@@ -323,4 +389,28 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                 )
             )
 
-    return Plan(tuple(time_tasks), tuple(pair_tasks))
+    corner_tasks = []
+    corner_crop_cache: dict[tuple[str, str], tuple[Crop, Crop]] = {}
+    for t in range(layout.nt):
+        corner_at_t = cfg.corner_at(t)
+        for c in layout.corners_at(t):
+            if f"{c.a},{c.b}" not in corner_at_t and f"{c.b},{c.a}" not in corner_at_t:
+                continue
+            key = (c.a, c.b)
+            if key not in corner_crop_cache:
+                corner_crop_cache[key] = _corner_crop(cfg, layout, meta, c.a, c.b, crop)
+            crop_a, crop_b = corner_crop_cache[key]
+            corner_tasks.append(
+                CornerTask(
+                    a=c.a,
+                    b=c.b,
+                    t=t,
+                    src=ref(c.a, t),
+                    dst=ref(c.b, t),
+                    crop_a=crop_a,
+                    crop_b=crop_b,
+                    precision=precision,
+                )
+            )
+
+    return Plan(tuple(time_tasks), tuple(pair_tasks), tuple(corner_tasks))

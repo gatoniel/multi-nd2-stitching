@@ -12,6 +12,7 @@ from multi_nd2_stitching.config import clamp_z
         ("aliases", []),
         ("reference_in_files", []),
         ("position_in_files", {}),
+        ("missing_in_files", []),
     ],
 )
 def test_position_optional_absent(cfg_dict, parse, field, expected):
@@ -55,7 +56,7 @@ def test_stop_at_present(cfg_dict, parse):
 
 # --- explicit YAML null must behave like absent -------------------------------
 # `field:` with nothing after it is the most common hand-editing accident.
-@pytest.mark.parametrize("field", ["aliases", "reference_in_files"])
+@pytest.mark.parametrize("field", ["aliases", "reference_in_files", "missing_in_files"])
 def test_position_explicit_null(cfg_dict, parse, field):
     cfg_dict["positions"]["tile_b"][field] = None
     assert getattr(parse(cfg_dict).positions["tile_b"], field) == []
@@ -69,6 +70,11 @@ def test_position_in_files_explicit_null(cfg_dict, parse):
 def test_position_in_files_round_trips(cfg_dict, parse):
     cfg_dict["positions"]["tile_b"]["position_in_files"] = {3: 2, 5: 0}
     assert parse(cfg_dict).positions["tile_b"].position_in_files == {3: 2, 5: 0}
+
+
+def test_missing_in_files_round_trips(cfg_dict, parse):
+    cfg_dict["positions"]["tile_b"]["missing_in_files"] = [1, 3]
+    assert parse(cfg_dict).positions["tile_b"].missing_in_files == [1, 3]
 
 
 @pytest.mark.parametrize(
@@ -207,6 +213,27 @@ def test_realign_is_not_part_of_names(cfg_dict, parse):
     cfg_dict["overrides"] = [{"at": 5, "realign": ["tile_a,tile_b"]}]
     o = parse(cfg_dict).overrides[0]
     assert o.names == set()
+
+
+# --- corner: always an "a,b" pair, promoting a Corner to a placement edge -----
+def test_corner_at_holds_pairs(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 21, "corner": ["tile_a,tile_b"]}]
+    cfg = parse(cfg_dict)
+    assert cfg.corner_at(21) == {"tile_a,tile_b"}
+    assert cfg.corner_at(22) == set()
+
+
+def test_corner_is_not_part_of_names(cfg_dict, parse):
+    """Adding a route doesn't drop/anchor/unanchor anything -- same exclusion
+    as shaped_peak/realign, and for the same reason."""
+    cfg_dict["overrides"] = [{"at": 5, "corner": ["tile_a,tile_b"]}]
+    o = parse(cfg_dict).overrides[0]
+    assert o.names == set()
+
+
+def test_corner_absent_defaults_to_empty_list(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 5, "drop": ["tile_b"]}]
+    assert parse(cfg_dict).overrides[0].corner == []
 
 
 # --- near: a rough manual estimate attached to a shaped_peak entry ------------

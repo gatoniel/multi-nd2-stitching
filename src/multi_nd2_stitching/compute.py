@@ -10,7 +10,7 @@ from typing import NamedTuple, Protocol
 import numpy as np
 import scipy.fft as spfft
 
-from .offsets import PairTask, SpectrumRef, TimeTask, VolumeRef
+from .offsets import CornerTask, PairTask, SpectrumRef, TimeTask, VolumeRef
 from .store import Offset, OffsetStore
 
 PRECISION = {"float32": np.float32, "float64": np.float64}
@@ -260,12 +260,20 @@ class Spectra:
 # --- running ------------------------------------------------------------------
 def run_task(task, spectra, workers: int = -1) -> Offset:
     """Execute one task against a spectrum provider."""
-    if not isinstance(task, (TimeTask, PairTask)):
+    if not isinstance(task, (TimeTask, PairTask, CornerTask)):
         raise TypeError(f"unknown task type {type(task).__name__}")
 
     s0, s1 = task.spectrum_refs()
     fft0, shape = spectra.get(s0)
     fft1, _ = spectra.get(s1)
+
+    if isinstance(task, CornerTask):
+        # Two different crops, one per tile, already narrowed to roughly the
+        # overlap rectangle -- no axis to free, no shaped_peak/near support
+        # yet (a corner correlation could plausibly want either later, but
+        # nothing requires it now), just the plain peak.
+        offset = phase_corr_from_ffts(fft0, fft1, shape, workers=workers)
+        return Offset.of(offset)
 
     near = None
     if task.near is not None:

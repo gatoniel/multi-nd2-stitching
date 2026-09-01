@@ -2,7 +2,7 @@
 
 import pytest
 import yaml
-from helpers import FakeReader, make_meta
+from helpers import FakeReader, grid_meta, make_meta
 
 from multi_nd2_stitching import cli
 from multi_nd2_stitching import metadata as M
@@ -1051,3 +1051,68 @@ def test_full_blend_is_unaffected(project, capsys):
     capsys.readouterr()
     run("blend", project, "--no-progress")
     assert "skeleton" not in capsys.readouterr().out
+
+
+# --- corner: an FFT-fitted diagonal edge, end to end ---------------------------
+def test_corner_override_places_a_diagonal_only_component(
+    tmp_path, capsys, monkeypatch
+):
+    """x and y share no edge Pair at all -- without `corner` this component
+    has no anchor; with it, stitch validate/graph both go clean end to end."""
+    files = []
+    for i in range(2):
+        p = tmp_path / f"f{i}.nd2"
+        p.write_bytes(b"x" * (10 + i))
+        files.append(str(p))
+
+    monkeypatch.setattr(
+        M,
+        "read_metadata",
+        lambda paths: grid_meta(
+            {"x": (0.0, 0.0), "y": (55.0, 55.0)}, list(paths), nt=2, nz=4, ny=8, nx=8
+        ),
+    )
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "positions": {
+            "x": {"start": [0, 0], "reference_in_files": [0, 1]},
+            "y": {"start": [0, 0]},
+        },
+        "overrides": [{"at": "0-3", "corner": ["x,y"]}],
+    }
+    cfg_path = tmp_path / "diag.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+    assert run("validate", cfg_path, "--deep") == 0
+    assert run("graph", cfg_path) == 0
+    assert "corner→ y" in capsys.readouterr().out
+
+
+def test_without_corner_the_diagonal_component_is_flagged(tmp_path, monkeypatch):
+    files = []
+    for i in range(2):
+        p = tmp_path / f"f{i}.nd2"
+        p.write_bytes(b"x" * (10 + i))
+        files.append(str(p))
+
+    monkeypatch.setattr(
+        M,
+        "read_metadata",
+        lambda paths: grid_meta(
+            {"x": (0.0, 0.0), "y": (55.0, 55.0)}, list(paths), nt=2, nz=4, ny=8, nx=8
+        ),
+    )
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "positions": {
+            "x": {"start": [0, 0], "reference_in_files": [0, 1]},
+            "y": {"start": [0, 0]},
+        },
+    }
+    cfg_path = tmp_path / "diag.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg))
+    assert run("validate", cfg_path, "--deep") == 1

@@ -7,6 +7,7 @@ from helpers import grid_meta, stub_files
 from multi_nd2_stitching.config import loads_config
 from multi_nd2_stitching.layout import build_layout
 from multi_nd2_stitching.placement import (
+    CORNER,
     DRIFT,
     ORIGIN,
     PAIR,
@@ -19,6 +20,8 @@ from multi_nd2_stitching.placement import (
 ANCHOR = {"reference_in_files": [0, 1]}
 LINE = {"a": (0.0, 0.0), "b": (55.0, 0.0), "c": (110.0, 0.0)}
 SQUARE = {"a": (0.0, 0.0), "b": (55.0, 0.0), "c": (0.0, 55.0), "d": (55.0, 55.0)}
+# x, y: diagonal to each other, no shared edge -- the case corner exists for.
+DIAGONAL = {"x": (0.0, 0.0), "y": (55.0, 55.0)}
 
 
 @pytest.fixture
@@ -218,6 +221,74 @@ def test_render_tile_mode_marks_shaped_peak(scene):
 def test_render_is_quiet_without_shaped_peak(scene):
     text = "\n".join(render(placements_for(chain(scene))))
     assert "SHAPED_PEAK" not in text and "shaped_peak" not in text
+
+
+# --- corner: promoting a diagonal-only connection to a placement edge --------
+def diagonal(scene, **kw):
+    return scene(
+        {"x": {"start": [0, 0], **ANCHOR}, "y": {"start": [0, 0]}},
+        DIAGONAL,
+        **kw,
+    )
+
+
+def test_no_edge_route_leaves_the_diagonal_tile_unplaced(scene):
+    """x, y share no edge Pair at all -- without corner, y simply can't be
+    reached; this is the exact gap the feature exists for."""
+    lay = diagonal(scene)
+    p = plan_placement(lay, 0)
+    assert "y" in p.unplaced
+    assert lay.pairs == ()  # confirms there really is no other route
+
+
+def test_corner_override_places_the_diagonal_tile(scene):
+    lay = diagonal(scene, overrides=[{"at": [0, 1, 2], "corner": ["x,y"]}])
+    p = plan_placement(lay, 0)
+    assert p.unplaced == ()
+    step = p.by_tile["y"]
+    assert step.kind == CORNER
+    assert step.via == "x"
+    assert step.axis is None
+
+
+@pytest.mark.parametrize("corner", ["x,y", "y,x"])
+def test_corner_enabled_either_order(scene, corner):
+    lay = diagonal(scene, overrides=[{"at": [0, 1, 2], "corner": [corner]}])
+    assert plan_placement(lay, 0).unplaced == ()
+
+
+def test_corner_toggles_off_at_an_unlisted_timepoint(scene):
+    """The requirement this exists for: on/off per timepoint, depending on
+    whether the connection is actually meant to be used there."""
+    lay = diagonal(scene, overrides=[{"at": [0], "corner": ["x,y"]}], nt=2)
+    assert plan_placement(lay, 0).unplaced == ()
+    assert "y" in plan_placement(lay, 1).unplaced
+
+
+def test_corner_enabling_an_already_reachable_pair_is_redundant(scene):
+    """a and d are already connected through b/c's edge Pairs -- enabling the
+    a-d corner too closes a cycle. The shared edge pool is what makes the
+    existing ambiguity detection catch this without any corner-specific
+    code."""
+    lay = scene(
+        {
+            "a": {"start": [0, 0], **ANCHOR},
+            "b": {"start": [0, 0]},
+            "c": {"start": [0, 0]},
+            "d": {"start": [0, 0]},
+        },
+        SQUARE,
+        overrides=[{"at": [0, 1, 2], "corner": ["a,d"]}],
+    )
+    p = plan_placement(lay, 0)
+    assert p.ambiguous
+    assert p.redundant
+
+
+def test_render_marks_a_corner_step(scene):
+    lay = diagonal(scene, overrides=[{"at": [0, 1, 2], "corner": ["x,y"]}])
+    text = "\n".join(render(placements_for(lay)))
+    assert "corner→ y" in text
 
 
 # --- rendering ----------------------------------------------------------------

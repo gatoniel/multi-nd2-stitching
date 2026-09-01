@@ -86,6 +86,11 @@ some files never get one. `position_in_files: {0: 2}` resolves a tile to file
 0's position 2 directly, bypassing name matching for exactly that file; other
 files for the same tile can still resolve by name as usual.
 
+A tile can also disappear for a file in the middle of its run and come back
+later -- present in file 1, gone in file 2, imaged again in file 3.
+`missing_in_files: [2]` says so; `drop` can't, since it only hides a tile
+that already resolved to a position, and there is none to resolve here.
+
 ### Anchors
 
 One tile per connected component carries the drift from timepoint to timepoint;
@@ -119,6 +124,17 @@ while keeping both in the mosaic:
   reason: "ch5_c carries the drift across the file 2/3 boundary"
   unanchor: [ch5_a]
   anchor: [ch5_c]
+```
+
+Two tiles can also overlap only across a corner (diagonal, no shared edge) --
+neighbours are only ever inferred along x or y, so that never becomes a route
+on its own. `corner: ["ch5_b,ch5_d"]` fits that corner by its own correlation
+and uses it as a real placement edge, for exactly the timepoints listed:
+
+```yaml
+- at: [40, 41, 42]
+  reason: "ch5_b/ch5_d share no edge neighbour; corner is their only route"
+  corner: ["ch5_b,ch5_d"]
 ```
 
 ## Commands

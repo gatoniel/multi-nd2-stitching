@@ -10,7 +10,7 @@ from __future__ import annotations
 import attrs
 import numpy as np
 
-from .placement import DRIFT, ORIGIN, plan_placement
+from .placement import CORNER, DRIFT, ORIGIN, plan_placement
 
 
 class MissingOffsets(Exception):
@@ -78,7 +78,8 @@ class Coordinates:
 def _index_tasks(plan):
     time_by = {(t.name, t.t_to): t for t in plan.time_tasks}
     pair_by = {(p.a, p.b, p.axis, p.t): p for p in plan.pair_tasks}
-    return time_by, pair_by
+    corner_by = {(c.a, c.b, c.t): c for c in plan.corner_tasks}
+    return time_by, pair_by, corner_by
 
 
 def build_coordinates(
@@ -93,7 +94,7 @@ def build_coordinates(
     out rather than reported. Inside the window everything is required.
     """
     t1 = layout.nt if t1 is None else t1
-    time_by, pair_by = _index_tasks(plan)
+    time_by, pair_by, corner_by = _index_tasks(plan)
     frames: list[dict[str, np.ndarray]] = []
     missing: list[str] = []
 
@@ -116,8 +117,22 @@ def build_coordinates(
                     continue
                 here[step.tile] = frames[t - 1][step.tile] + offset.as_array()
                 continue
+            if step.kind == CORNER:
+                forward = corner_by.get((step.via, step.tile, t))
+                backward = corner_by.get((step.tile, step.via, t))
+                task = forward or backward
+                if task is None or step.via not in here:
+                    continue
+                offset = store.get(task.key)
+                if offset is None:
+                    if in_window:
+                        missing.append(task.describe())
+                    continue
+                arr = offset.as_array()
+                here[step.tile] = here[step.via] + (arr if forward else -arr)
+                continue
 
-            # a neighbour edge: the parent must already be placed
+            # a neighbour edge (PAIR): the parent must already be placed
             forward = pair_by.get((step.via, step.tile, step.axis, t))
             backward = pair_by.get((step.tile, step.via, step.axis, t))
             task = forward or backward

@@ -99,6 +99,14 @@ ever imposes an upper bound on the weight `blend_weights` may hand back, so
 a well-covered corner (a real third tile *is* there) is a no-op, and an
 under-covered one (there isn't) gets tapered for the first time.
 
+**A `corner` override is the only way a `Corner` becomes a placement edge.**
+Discovery alone never makes one — `plan_placement` only adds a `Corner` to
+its edge pool when `t in o.at` *and* `layout.corner_alive[t, k]`, exactly
+the same "opt-in and alive" gate `shaped_peak`/`realign` pairs already use.
+`check_layout`'s own connectivity check has to build the identical pool
+(pairs plus enabled, alive corners) or it will report a component the
+override genuinely connects as unanchored — the two must not drift apart.
+
 **Per-timepoint blend work is bounded by the bounding box, not the canvas.**
 A whole-canvas `np.divide` costs in proportion to the canvas, which makes
 padding ruinously expensive. Same for zarr writes: they must start on chunk
@@ -147,6 +155,16 @@ boundaries or zarr read-modify-writes every partial chunk.
   subtract `PairTask.shift_px` back out before the value means anything to
   `compute._windowed_peak_index`, which searches the *raw* (pre-`shift_px`)
   space, same as `to_signed_shift` always has.
+- `layout.corner_direction` is the one place that needs a `Corner`'s
+  direction from *nominal* stage coordinates rather than `coords.at(t)` --
+  `CornerTask`'s crop has to exist before either tile necessarily has a
+  coordinate at all (that's the point of fitting one), so `blend.py`'s
+  "read the real offset out of coords" trick isn't available yet.
+- `Position.missing_in_files` is not the same problem `drop` solves. `drop`
+  only hides an already-*resolved* tile at a timepoint; a file where the
+  position plain doesn't exist fails during resolution itself, before any
+  override runs. Use `missing_in_files` for a genuine gap in the middle of
+  a tile's `[start, end)`, `drop` for hiding a tile that's still there.
 - The `nd2` handle is not thread-safe. Never peek into the handle pool
   (`pool.queue[0]`); check a handle out, or use the reserved index handle.
 - `np.zeros` hands back lazily-zeroed pages, so allocating a fresh buffer per

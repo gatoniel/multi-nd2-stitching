@@ -67,6 +67,29 @@ def test_realistic_config_is_valid(cfg_dict, parse):
             lambda d: d["positions"]["tile_b"].update(end=1, position_in_files={1: 0}),
             "names file 1 but is only alive",
         ),
+        # missing_in_files
+        (
+            lambda d: d["positions"]["tile_b"].update(missing_in_files=[5]),
+            "out of range",
+        ),
+        (
+            lambda d: d["positions"]["tile_b"].update(end=1, missing_in_files=[1]),
+            "outside 0..0",
+        ),
+        (
+            lambda d: d["positions"]["tile_a"].update(missing_in_files=[0]),
+            "also in reference_in_files",
+        ),
+        (
+            lambda d: d["positions"]["tile_b"].update(
+                position_in_files={0: 1}, missing_in_files=[0]
+            ),
+            "also in position_in_files",
+        ),
+        (
+            lambda d: d["positions"]["tile_b"].update(missing_in_files=[0, 0]),
+            "missing_in_files: contains duplicates",
+        ),
         # global
         (lambda d: d.update(grid_spacing_error=30), "windows overlap"),
         (lambda d: d.update(files=["a.nd2", "a.nd2"]), "duplicates"),
@@ -103,6 +126,10 @@ def test_detects_problem(cfg_dict, parse, mutate, fragment):
             {"at": 5, "shaped_peak": ["tile_a"], "near": {"tile_a": [0, 1]}},
             "must be [dz, dy, dx] (3 integers)",
         ),
+        # corner
+        ({"at": 5, "corner": ["nope,tile_a"]}, "unknown position"),
+        ({"at": 5, "corner": ["tile_a"]}, "must be an 'a,b' pair"),
+        ({"at": 5, "corner": ["tile_a,tile_b,tile_c"]}, "must be an 'a,b' pair"),
     ],
 )
 def test_detects_override_problem(cfg_dict, parse, override, fragment):
@@ -128,6 +155,12 @@ def test_position_in_files_mixed_with_a_named_file_is_fine(cfg_dict, parse):
     """One file resolved by index, the other still by name -- the whole
     point is being able to mix both for the same tile."""
     cfg_dict["positions"]["tile_b"]["position_in_files"] = {0: 1}
+    assert check(parse(cfg_dict)) == []
+
+
+# --- missing_in_files -----------------------------------------------------------
+def test_missing_in_files_gap_is_fine(cfg_dict, parse):
+    cfg_dict["positions"]["tile_b"]["missing_in_files"] = [1]
     assert check(parse(cfg_dict)) == []
 
 
@@ -157,6 +190,12 @@ def test_shaped_peak_with_a_matching_near_hint_is_fine(cfg_dict, parse):
 def test_realign_pair_only_block_is_not_a_no_op(cfg_dict, parse):
     cfg_dict["realignment_slices"] = {"y": [1, 2]}
     cfg_dict["overrides"] = [{"at": 5, "realign": ["tile_a,tile_b"]}]
+    assert check(parse(cfg_dict)) == []
+
+
+# --- corner -----------------------------------------------------------------
+def test_corner_only_block_is_not_a_no_op(cfg_dict, parse):
+    cfg_dict["overrides"] = [{"at": 5, "corner": ["tile_a,tile_b"]}]
     assert check(parse(cfg_dict)) == []
 
 

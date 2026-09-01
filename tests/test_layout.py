@@ -4,8 +4,13 @@ import yaml
 from helpers import build, grid_meta, make_meta, stub_files
 
 from multi_nd2_stitching.config import loads_config
-from multi_nd2_stitching.layout import build_layout
-from multi_nd2_stitching.validate import check_layout, check_realign, check_shaped_peak
+from multi_nd2_stitching.layout import build_layout, corner_direction
+from multi_nd2_stitching.validate import (
+    check_corner,
+    check_layout,
+    check_realign,
+    check_shaped_peak,
+)
 
 # A 2x2 grid, one step = 55um, same spacing test_placement.py's SQUARE uses.
 SQUARE = {"a": (0.0, 0.0), "b": (55.0, 0.0), "c": (0.0, 55.0), "d": (55.0, 55.0)}
@@ -236,6 +241,55 @@ def test_position_in_files_collision_with_a_name_match_is_loud(cfg_dict):
         build_layout(loads_config(yaml.safe_dump(cfg_dict)), meta)
 
 
+# --- missing_in_files: a gap in the middle of an otherwise-contiguous range ---
+def test_missing_in_files_gap_resolves_to_none_without_raising(cfg_dict):
+    cfg_dict["files"] = [f"f{i}" for i in range(3)]
+    cfg_dict["positions"]["tile_a"]["reference_in_files"] = [0, 1, 2]
+    cfg_dict["positions"]["tile_b"] = {"start": [0, 0], "missing_in_files": [1]}
+    lay = build(cfg_dict, n_files=3, nt=5)
+    assert lay.tile["tile_b"].position[0] is not None
+    assert lay.tile["tile_b"].position[1] is None
+    assert lay.tile["tile_b"].position[2] is not None
+
+
+def test_missing_in_files_clears_tile_alive_for_the_gap_only(cfg_dict):
+    cfg_dict["files"] = [f"f{i}" for i in range(3)]
+    cfg_dict["positions"]["tile_a"]["reference_in_files"] = [0, 1, 2]
+    cfg_dict["positions"]["tile_b"] = {"start": [0, 0], "missing_in_files": [1]}
+    lay = build(cfg_dict, n_files=3, nt=5)
+    i = lay.ti("tile_b")
+    assert lay.tile_alive[4, i]  # file 0's last t
+    assert not lay.tile_alive[5, i]  # file 1's first t: the gap
+    assert not lay.tile_alive[9, i]  # file 1's last t: the gap
+    assert lay.tile_alive[10, i]  # file 2's first t: alive again
+
+
+def test_missing_in_files_reappearance_via_an_existing_anchor_is_fine(cfg_dict):
+    """The realistic case: tile_b never needed its own anchor -- it hangs off
+    tile_a, which stays alive (and a reference) straight through the gap."""
+    cfg_dict["files"] = [f"f{i}" for i in range(3)]
+    cfg_dict["positions"]["tile_a"]["reference_in_files"] = [0, 1, 2]
+    cfg_dict["positions"]["tile_b"] = {"start": [0, 0], "missing_in_files": [1]}
+    lay = build(cfg_dict, n_files=3, nt=5)
+    assert check_layout(lay) == []
+
+
+def test_missing_in_files_reappearance_without_an_anchor_is_still_flagged(cfg_dict):
+    """A lone tile reappearing after a gap needs a fresh anchor, same as any
+    other tile starting mid-run -- check_layout catches it unchanged."""
+    cfg_dict["files"] = [f"f{i}" for i in range(3)]
+    cfg_dict["positions"] = {
+        "tile_a": {
+            "start": [0, 0],
+            "reference_in_files": [0],
+            "missing_in_files": [1],
+        }
+    }
+    lay = build(cfg_dict, n_files=3, nt=5)
+    problems = check_layout(lay)
+    assert any("no anchor" in p for p in problems), problems
+
+
 # --- pair discovery -----------------------------------------------------------
 def test_pairs_found_along_x(cfg_dict):
     lay = build(cfg_dict, axis="x")
@@ -309,6 +363,89 @@ def test_dropping_either_tile_kills_the_corner(tmp_path):
     lay = build_layout(loads_config(yaml.safe_dump(cfg)), grid_meta(ELL, files, nt=3))
     assert lay.corners_at(1) == []
     assert len(lay.corners_at(0)) == 1
+
+
+# --- corner_direction: the nominal crop direction a CornerTask needs ----------
+def _square_layout(tmp_path, flip_x=False, flip_y=False):
+    files = stub_files(tmp_path, 1)
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "flip_x": flip_x,
+        "flip_y": flip_y,
+        "positions": {n: {"start": [0, 0]} for n in SQUARE},
+    }
+    meta = grid_meta(SQUARE, files, nt=1)
+    return build_layout(loads_config(yaml.safe_dump(cfg)), meta), meta
+
+
+@pytest.mark.parametrize("flip_x", [False, True])
+@pytest.mark.parametrize("flip_y", [False, True])
+def test_corner_direction_matches_the_pair_convention(tmp_path, flip_x, flip_y):
+    """Empirically tied to _discover_pairs' own a/b choice, across every
+    flip_x/flip_y combination: whichever direction a real Pair independently
+    gives for each axis, corner_direction gives the same sign for that axis."""
+    lay, meta = _square_layout(tmp_path, flip_x, flip_y)
+    px = next(p for p in lay.pairs if {p.a, p.b} == {"a", "b"} and p.axis == 2)
+    py = next(p for p in lay.pairs if {p.a, p.b} == {"a", "c"} and p.axis == 1)
+    x_dir_from_a = 1 if px.a == "a" else -1
+    y_dir_from_a = 1 if py.a == "a" else -1
+    dy_sign, dx_sign = corner_direction(lay.config, meta, lay.tile, "a", "d")
+    assert (dy_sign, dx_sign) == (y_dir_from_a, x_dir_from_a)
+
+
+def test_corner_direction_reverses_with_the_arguments(tmp_path):
+    lay, meta = _square_layout(tmp_path)
+    forward = corner_direction(lay.config, meta, lay.tile, "a", "d")
+    backward = corner_direction(lay.config, meta, lay.tile, "d", "a")
+    assert backward == (-forward[0], -forward[1])
+
+
+# x, y: diagonal to each other only -- no edge Pair connects them at all.
+DIAGONAL = {"x": (0.0, 0.0), "y": (55.0, 55.0)}
+
+
+def test_check_layout_flags_a_diagonal_only_component_without_corner(tmp_path):
+    """Without a corner override, y has no route to x's anchor at all --
+    check_layout must see that, not silently ignore it."""
+    files = stub_files(tmp_path, 2)
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "positions": {
+            "x": {"start": [0, 0], "reference_in_files": [0, 1]},
+            "y": {"start": [0, 0]},
+        },
+    }
+    lay = build_layout(
+        loads_config(yaml.safe_dump(cfg)), grid_meta(DIAGONAL, files, nt=1)
+    )
+    assert lay.pairs == ()  # confirms there really is no edge route
+    problems = check_layout(lay)
+    assert any("no anchor" in p and "'y'" in p for p in problems), problems
+
+
+def test_check_layout_is_fine_once_corner_connects_the_component(tmp_path):
+    """The fix this pins: check_layout has to see the same enabled-corner
+    edge pool plan_placement builds, or it would wrongly flag a component a
+    `corner` override genuinely connects."""
+    files = stub_files(tmp_path, 2)
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "positions": {
+            "x": {"start": [0, 0], "reference_in_files": [0, 1]},
+            "y": {"start": [0, 0]},
+        },
+        "overrides": [{"at": [0, 1], "corner": ["x,y"]}],
+    }
+    lay = build_layout(
+        loads_config(yaml.safe_dump(cfg)), grid_meta(DIAGONAL, files, nt=1)
+    )
+    assert check_layout(lay) == []
 
 
 # --- shift_px -----------------------------------------------------------------
@@ -515,6 +652,51 @@ def test_realign_pair_is_fine_when_the_other_axis_differs(cfg_dict):
     cfg_dict["realignment_slices"] = {"x": [5, 15], **_REALIGN_DIFFERS}
     cfg_dict["overrides"] = [{"at": 3, "realign": ["tile_a,tile_b"]}]
     assert check_realign(build(cfg_dict)) == []
+
+
+# --- check_corner ---------------------------------------------------------------
+def _diagonal_layout(tmp_path, overrides=None, nt=1):
+    files = stub_files(tmp_path, 2)
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "positions": {n: {"start": [0, 0]} for n in DIAGONAL},
+    }
+    if overrides:
+        cfg["overrides"] = overrides
+    return build_layout(
+        loads_config(yaml.safe_dump(cfg)), grid_meta(DIAGONAL, files, nt=nt)
+    )
+
+
+def test_corner_pair_alive_throughout_is_fine(tmp_path):
+    lay = _diagonal_layout(tmp_path, overrides=[{"at": [0, 1], "corner": ["x,y"]}])
+    assert check_corner(lay) == []
+
+
+def test_corner_pair_reversed_order_is_fine(tmp_path):
+    lay = _diagonal_layout(tmp_path, overrides=[{"at": [0, 1], "corner": ["y,x"]}])
+    assert check_corner(lay) == []
+
+
+def test_corner_flags_a_pair_that_never_exists(cfg_dict):
+    """tile_a/tile_b are edge-adjacent (a line), never diagonal."""
+    cfg_dict["overrides"] = [{"at": 3, "corner": ["tile_a,tile_b"]}]
+    problems = check_corner(build(cfg_dict))
+    assert any("not a discovered neighbour pair" in p for p in problems), problems
+
+
+def test_corner_flags_a_pair_not_alive_at_that_time(tmp_path):
+    lay = _diagonal_layout(
+        tmp_path,
+        overrides=[
+            {"at": [1], "drop": ["y"]},
+            {"at": [0, 1], "corner": ["x,y"]},
+        ],
+    )
+    problems = check_corner(lay)
+    assert any("not alive at t=1" in p for p in problems), problems
 
 
 # --- sanity -------------------------------------------------------------------

@@ -1,10 +1,33 @@
 from pathlib import Path
 
 import pytest
-from helpers import build, make_meta, stub_files
+import yaml
+from helpers import build, grid_meta, make_meta, stub_files
 
+from multi_nd2_stitching.config import loads_config
+from multi_nd2_stitching.layout import build_layout, corner_direction
 from multi_nd2_stitching.offsets import Crop, build_plan
 from multi_nd2_stitching.store import Offset, OffsetStore
+
+# a, b (x-neighbour of a), c (y-neighbour of a) -- b and c are diagonal to
+# each other, with no fourth tile to connect them via edge Pairs instead.
+ELL = {"a": (0.0, 0.0), "b": (55.0, 0.0), "c": (0.0, 55.0)}
+
+
+def _corner_plan(tmp_path, corner=None, nt=3):
+    files = stub_files(tmp_path, 2)
+    cfg = {
+        "files": files,
+        "grid_spacing": 55,
+        "grid_spacing_error": 5,
+        "shift_px": 3,
+        "positions": {n: {"start": [0, 0]} for n in ELL},
+    }
+    if corner is not None:
+        cfg["overrides"] = [{"at": list(range(nt)), "corner": [corner]}]
+    meta = grid_meta(ELL, files, nt=nt)
+    lay = build_layout(loads_config(yaml.safe_dump(cfg)), meta)
+    return build_plan(lay, meta), lay, meta
 
 
 @pytest.fixture
@@ -295,3 +318,71 @@ def test_crop_clamps_z_to_stack_depth():
 def test_crop_roundtrips_to_slices():
     c = Crop.of((slice(5, 40), slice(1, 2), slice(None)), 80)
     assert c.as_slices() == (slice(5, 40), slice(1, 2), slice(None))
+
+
+# --- CornerTask -----------------------------------------------------------------
+def test_corner_task_not_created_without_an_override(tmp_path):
+    p, _lay, _meta = _corner_plan(tmp_path)
+    assert p.corner_tasks == ()
+
+
+def test_corner_task_created_when_enabled_and_alive(tmp_path):
+    p, _lay, _meta = _corner_plan(tmp_path, corner="b,c", nt=3)
+    assert {t.t for t in p.corner_tasks} == {0, 1, 2}
+    assert {(t.a, t.b) for t in p.corner_tasks} == {("b", "c")}
+
+
+@pytest.mark.parametrize("corner", ["b,c", "c,b"])
+def test_corner_task_enabled_either_order(tmp_path, corner):
+    p, _lay, _meta = _corner_plan(tmp_path, corner=corner, nt=1)
+    assert len(p.corner_tasks) == 1
+
+
+def test_corner_task_crop_is_the_shift_px_cube(tmp_path):
+    p, lay, _meta = _corner_plan(tmp_path, corner="b,c", nt=1)
+    task = p.corner_tasks[0]
+    s = lay.shift_px
+    for crop in (task.crop_a, task.crop_b):
+        assert crop.y[1] - crop.y[0] == s
+        assert crop.x[1] - crop.x[0] == s
+        assert crop.z == (None, lay.nz)  # full stack, no slices restriction given
+
+
+def test_corner_task_crops_are_on_opposite_sides(tmp_path):
+    """a's crop faces b, b's crop faces a -- opposite corners of each tile."""
+    p, lay, meta = _corner_plan(tmp_path, corner="b,c", nt=1)
+    task = p.corner_tasks[0]
+    dy_sign, dx_sign = corner_direction(lay.config, meta, lay.tile, task.a, task.b)
+    s = lay.shift_px
+    expect_a_y = (lay.ny - s, lay.ny) if dy_sign > 0 else (0, s)
+    expect_b_y = (0, s) if dy_sign > 0 else (lay.ny - s, lay.ny)
+    expect_a_x = (lay.nx - s, lay.nx) if dx_sign > 0 else (0, s)
+    expect_b_x = (0, s) if dx_sign > 0 else (lay.nx - s, lay.nx)
+    assert task.crop_a.y == expect_a_y
+    assert task.crop_b.y == expect_b_y
+    assert task.crop_a.x == expect_a_x
+    assert task.crop_b.x == expect_b_x
+
+
+def test_corner_task_key_changes_with_the_crop(tmp_path):
+    p, lay, meta = _corner_plan(tmp_path, corner="b,c", nt=1)
+    task = p.corner_tasks[0]
+    other = build_plan(
+        build_layout(
+            loads_config(
+                yaml.safe_dump(
+                    {
+                        "files": lay.config.files,
+                        "grid_spacing": 55,
+                        "grid_spacing_error": 5,
+                        "shift_px": 5,  # different -> different crop
+                        "positions": {n: {"start": [0, 0]} for n in ELL},
+                        "overrides": [{"at": [0], "corner": ["b,c"]}],
+                    }
+                )
+            ),
+            meta,
+        ),
+        meta,
+    ).corner_tasks[0]
+    assert task.key != other.key

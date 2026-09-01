@@ -107,6 +107,30 @@ def _check_positions(cfg: StitchingConfig, p: list[str]) -> None:
             else:
                 seen_indices[key] = name
 
+        # An expected gap must still be a file this tile is otherwise alive
+        # in, and can't also claim to be anchored or explicitly indexed there
+        # -- those are contradictory intents for the same file.
+        for f in sorted(set(pos.missing_in_files)):
+            if not 0 <= f < n:
+                p.append(f"{where}.missing_in_files: file index {f} out of range")
+            elif not pos.alive_in_file(f, n):
+                p.append(
+                    f"{where}.missing_in_files: file {f} is outside {f0}.."
+                    f"{pos.last_file(n)}, where it would apply"
+                )
+            if f in pos.reference_in_files:
+                p.append(
+                    f"{where}.missing_in_files: file {f} is also in "
+                    "reference_in_files; it cannot anchor a file it is missing from"
+                )
+            if f in pos.position_in_files:
+                p.append(
+                    f"{where}.missing_in_files: file {f} is also in "
+                    "position_in_files; pick one"
+                )
+        if len(set(pos.missing_in_files)) != len(pos.missing_in_files):
+            p.append(f"{where}.missing_in_files: contains duplicates")
+
 
 def _check_coverage(cfg: StitchingConfig, p: list[str]) -> None:
     uncovered = [f for f in range(cfg.n_files) if not cfg.references_for_file(f)]
@@ -156,6 +180,14 @@ def _check_overrides(cfg: StitchingConfig, p: list[str]) -> None:
             bad = sorted(n for n in parts if n not in known)
             if bad:
                 p.append(f"{where}.realign: unknown position(s) {bad} in '{entry}'")
+        for entry in o.corner:
+            parts = entry.split(",")
+            if len(parts) != 2:
+                p.append(f"{where}.corner: '{entry}' must be an 'a,b' pair")
+                continue
+            bad = sorted(n for n in parts if n not in known)
+            if bad:
+                p.append(f"{where}.corner: unknown position(s) {bad} in '{entry}'")
         for key, hint in o.near.items():
             if key not in o.shaped_peak:
                 p.append(
@@ -164,7 +196,7 @@ def _check_overrides(cfg: StitchingConfig, p: list[str]) -> None:
                 )
             if len(hint) != 3 or not all(isinstance(v, int) for v in hint):
                 p.append(f"{where}.near['{key}']: must be [dz, dy, dx] (3 integers)")
-        if not (o.names or o.shaped_peak or o.realign):
+        if not (o.names or o.shaped_peak or o.realign or o.corner):
             p.append(f"{where}: no drop/anchor/realign/shaped_peak, block does nothing")
         both = sorted(set(o.drop) & (set(o.anchor) | set(o.realign)))
         if both:
@@ -326,7 +358,10 @@ def check_layout(layout) -> list[str]:
 
     At every timepoint, every connected component of alive tiles must contain an
     anchor -- otherwise final_coordinates cannot place it and its flood-fill loop
-    never terminates.
+    never terminates. Connectivity has to include enabled Corner edges too, the
+    same edge pool `placement.plan_placement` builds -- otherwise a component a
+    `corner` override genuinely connects would be reported unanchored here even
+    though it places fine.
     """
     p: list[str] = []
     unanchored: dict[tuple[str, ...], list[int]] = {}
@@ -339,7 +374,13 @@ def check_layout(layout) -> list[str]:
             empty.append(t)
             continue
         anchors = set(layout.anchors_at(t))
-        for comp in _components(alive, layout.pairs_at(t)):
+        corner_names = layout.config.corner_at(t)
+        edges = list(layout.pairs_at(t)) + [
+            c
+            for c in layout.corners_at(t)
+            if f"{c.a},{c.b}" in corner_names or f"{c.b},{c.a}" in corner_names
+        ]
+        for comp in _components(alive, edges):
             if not anchors & set(comp):
                 unanchored.setdefault(tuple(sorted(comp)), []).append(t)
         if t > 0:
@@ -365,29 +406,38 @@ def check_layout(layout) -> list[str]:
 _AXIS_NAME = ("z", "y", "x")
 
 
-def _check_pair_overrides(layout, verb: str, get_entries) -> list[str]:
-    """Shared by check_shaped_peak and check_realign: a pair-form entry
-    ('a,b') must name a pair that is actually there.
+def _check_pair_overrides(
+    layout, verb: str, get_entries, edges=None, alive=None
+) -> list[str]:
+    """Shared by check_shaped_peak, check_realign, and check_corner: a
+    pair-form entry ('a,b') must name a pair (or Corner) that is actually
+    there.
 
     'a,b' names an edge in the discovered neighbour graph, not two arbitrary
     tile names -- config-tier validation can only check that both names are
     known positions (`_check_overrides`), not whether they ever pair up or
     are alive together at the timepoint given. If they aren't, there is no
-    PairTask for the override to attach to: `build_plan` simply never sets
-    the verb's flag anywhere, and the override silently does nothing.
+    task for the override to attach to: `build_plan` simply never sets the
+    verb's flag anywhere, and the override silently does nothing.
+
+    `edges`/`alive` default to `layout.pairs`/`layout.pair_alive`;
+    `check_corner` passes `layout.corners`/`layout.corner_alive` instead --
+    same shape, same aliveness reasoning, different edge type.
     """
     p: list[str] = []
-    pair_index = {frozenset((pr.a, pr.b)): k for k, pr in enumerate(layout.pairs)}
+    edges = layout.pairs if edges is None else edges
+    alive = layout.pair_alive if alive is None else alive
+    edge_index = {frozenset((e.a, e.b)): k for k, e in enumerate(edges)}
     for o in layout.config.overrides:
         for entry in get_entries(o):
             parts = entry.split(",")
             if len(parts) != 2:
                 continue  # a bare tile name -- not this check's concern
-            k = pair_index.get(frozenset(parts))
+            k = edge_index.get(frozenset(parts))
             if k is None:
                 p.append(f"{verb}: '{entry}' is not a discovered neighbour pair")
                 continue
-            dead = [t for t in o.at if not layout.pair_alive[t, k]]
+            dead = [t for t in o.at if not alive[t, k]]
             if dead:
                 p.append(
                     f"{verb}: '{entry}' is not alive at t={_ranges(dead)}; "
@@ -432,3 +482,16 @@ def check_realign(layout) -> list[str]:
                     "pair -- this recomputes to the identical crop"
                 )
     return p
+
+
+def check_corner(layout) -> list[str]:
+    """A corner override must name a real, alive Corner -- see
+    `_check_pair_overrides`. Always the pair form (a corner has no drift-step
+    equivalent), so no bare-name carve-out is needed here."""
+    return _check_pair_overrides(
+        layout,
+        "corner",
+        lambda o: o.corner,
+        edges=layout.corners,
+        alive=layout.corner_alive,
+    )

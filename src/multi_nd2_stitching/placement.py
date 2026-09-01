@@ -14,12 +14,26 @@ printed graph is the placement that actually happened, not a reconstruction.
 from __future__ import annotations
 
 from collections import deque
+from typing import NamedTuple
 
 import attrs
 
 ORIGIN = "origin"
 DRIFT = "drift"
 PAIR = "pair"
+CORNER = "corner"  # a fitted diagonal Corner, opted into by the `corner` override
+
+
+class Edge(NamedTuple):
+    """One placement edge for the flood fill: a real neighbour Pair, or a
+    Corner opted into by the `corner` override at this timepoint. Unifying
+    them into one pool is what makes the existing cycle/multiple-route
+    detection below cover corners too, with no extra logic."""
+
+    a: str
+    b: str
+    axis: int | None  # None for a corner -- it has none
+    kind: str
 
 
 @attrs.frozen
@@ -29,7 +43,7 @@ class Step:
     tile: str
     kind: str
     via: str | None = None
-    axis: int | None = None
+    axis: int | None = None  # None for ORIGIN/DRIFT/CORNER -- a corner has no axis
     shaped: bool = False  # this step's offset used the shaped_peak override
 
     @property
@@ -38,6 +52,8 @@ class Step:
             return "origin"
         if self.kind == DRIFT:
             return "drift from t-1"
+        if self.kind == CORNER:
+            return f"corner from {self.via}"
         return f"{'y' if self.axis == 1 else 'x'} from {self.via}"
 
 
@@ -47,7 +63,7 @@ class Placement:
 
     t: int
     steps: tuple[Step, ...]
-    redundant: tuple[tuple[str, str, int], ...] = ()
+    redundant: tuple[tuple[str, str, int | None], ...] = ()
     unplaced: tuple[str, ...] = ()
     over_anchored: tuple[tuple[str, ...], ...] = ()
 
@@ -117,6 +133,12 @@ def plan_placement(layout, t: int, seeded=None) -> Placement:
     def pair_shaped(a: str, b: str) -> bool:
         return f"{a},{b}" in shaped_names or f"{b},{a}" in shaped_names
 
+    # corner names an "a,b" pair too, either order -- see corner_at.
+    corner_names = layout.config.corner_at(t)
+
+    def corner_enabled(a: str, b: str) -> bool:
+        return f"{a},{b}" in corner_names or f"{b},{a}" in corner_names
+
     anchors = [n for n in layout.anchors_at(t) if seeded is None or n in seeded]
     steps: list[Step] = []
     placed: set[str] = set()
@@ -139,35 +161,41 @@ def plan_placement(layout, t: int, seeded=None) -> Placement:
     seeds = set(placed)
 
     pairs = list(layout.pairs_at(t))
-    redundant: list[tuple[str, str, int]] = []
-    queue = deque(sorted(pairs, key=lambda p: (p.a, p.b, p.axis)))
+    edges = [Edge(p.a, p.b, p.axis, PAIR) for p in pairs]
+    edges += [
+        Edge(c.a, c.b, None, CORNER)
+        for c in layout.corners_at(t)
+        if corner_enabled(c.a, c.b)
+    ]
+    redundant: list[tuple[str, str, int | None]] = []
+    queue = deque(sorted(edges, key=lambda e: (e.a, e.b, e.kind, e.axis or 0)))
     stalled = 0
     while queue and stalled <= len(queue):
-        p = queue.popleft()
-        if p.a in placed and p.b in placed:
+        e = queue.popleft()
+        if e.a in placed and e.b in placed:
             # Both ends already fixed: this edge closes a cycle, or joins two
             # separately seeded chains. Either way the placement is not unique.
-            redundant.append((p.a, p.b, p.axis))
+            redundant.append((e.a, e.b, e.axis))
             stalled += 1
-        elif p.a in placed:
+        elif e.a in placed:
             steps.append(
-                Step(p.b, PAIR, via=p.a, axis=p.axis, shaped=pair_shaped(p.a, p.b))
+                Step(e.b, e.kind, via=e.a, axis=e.axis, shaped=pair_shaped(e.a, e.b))
             )
-            placed.add(p.b)
+            placed.add(e.b)
             stalled = 0
-        elif p.b in placed:
+        elif e.b in placed:
             steps.append(
-                Step(p.a, PAIR, via=p.b, axis=p.axis, shaped=pair_shaped(p.a, p.b))
+                Step(e.a, e.kind, via=e.b, axis=e.axis, shaped=pair_shaped(e.a, e.b))
             )
-            placed.add(p.a)
+            placed.add(e.a)
             stalled = 0
         else:
-            queue.append(p)
+            queue.append(e)
             stalled += 1
 
     over = []
     if len(seeds) > 1:
-        for group in _components(alive, pairs):
+        for group in _components(alive, edges):
             hit = sorted(seeds & set(group))
             if len(hit) > 1:
                 over.append(tuple(hit))
@@ -201,6 +229,14 @@ def _components(names, pairs):
     return list(groups.values())
 
 
+def _arrow(axis: int | None) -> str:
+    """The edge label rendering uses: y/x for a Pair, "corner" for a Corner
+    (axis=None)."""
+    if axis is None:
+        return "corner"
+    return "y" if axis == 1 else "x"
+
+
 # --- rendering ----------------------------------------------------------------
 def group_runs(placements):
     """Collapse consecutive timepoints with identical topology.
@@ -229,10 +265,9 @@ def render_tree(placement: Placement, indent: str = "  ") -> list[str]:
             new_prefix = indent
         else:
             arm = "└─" if last else "├─"
-            axis = "y" if step.axis == 1 else "x"
-            lines.append(f"{prefix}{arm}{axis}→ {step.tile}{tag}")
+            lines.append(f"{prefix}{arm}{_arrow(step.axis)}→ {step.tile}{tag}")
             new_prefix = prefix + ("   " if last else "│  ")
-        kids = sorted(children.get(step.tile, []), key=lambda s: (s.axis, s.tile))
+        kids = sorted(children.get(step.tile, []), key=lambda s: (s.axis or -1, s.tile))
         for i, kid in enumerate(kids):
             walk(kid, new_prefix, i == len(kids) - 1, False)
 
@@ -264,7 +299,7 @@ def render(placements, tile: str | None = None, indent: str = "  ") -> list[str]
                         (
                             f"{s.tile}[{s.label}]"
                             if s.via is None
-                            else f"{'y' if s.axis == 1 else 'x'}→ {s.tile}"
+                            else f"{_arrow(s.axis)}→ {s.tile}"
                         )
                         + ("  [shaped_peak]" if s.shaped else "")
                         for s in chain
@@ -274,7 +309,7 @@ def render(placements, tile: str | None = None, indent: str = "  ") -> list[str]
             lines.extend(render_tree(p, indent))
         for a, b, axis in p.redundant:
             lines.append(
-                f"{indent}! redundant edge {a}|{b} ({'y' if axis == 1 else 'x'}): "
+                f"{indent}! redundant edge {a}|{b} ({_arrow(axis)}): "
                 "both ends already placed, so this offset is never used"
             )
         for group in p.over_anchored:

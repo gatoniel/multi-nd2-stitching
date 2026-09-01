@@ -15,9 +15,15 @@ from pathlib import Path
 from .config import load_config
 from .layout import build_layout
 from .metadata import load_metadata
-from .offsets import PairTask, build_plan, file_keys
+from .offsets import TimeTask, build_plan, file_keys
 from .store import OffsetStore
-from .validate import check, check_layout, check_realign, check_shaped_peak
+from .validate import (
+    check,
+    check_corner,
+    check_layout,
+    check_realign,
+    check_shaped_peak,
+)
 from .workspace import Workspace
 
 
@@ -48,7 +54,8 @@ def _prepare(args, *, need_metadata: bool):
         check(cfg, nts=meta.nts)
         + check_layout(layout)
         + check_shaped_peak(layout)
-        + check_realign(layout),
+        + check_realign(layout)
+        + check_corner(layout),
         str(args.config),
     )
     return ws, cfg, meta, layout
@@ -206,14 +213,14 @@ def cmd_status(args) -> int:
     )
     print(
         f"tasks      {len(plan.tasks)}  ({len(plan.time_tasks)} drift, "
-        f"{len(plan.pair_tasks)} pair)"
+        f"{len(plan.pair_tasks)} pair, {len(plan.corner_tasks)} corner)"
     )
     print(
         f"cached     {done}   pending {len(pending)}"
         f"   [{done / max(len(plan.tasks), 1):.0%} complete]"
     )
     if pending:
-        ts = sorted({t.t_to if not isinstance(t, PairTask) else t.t for t in pending})
+        ts = sorted({t.t_to if isinstance(t, TimeTask) else t.t for t in pending})
         print(f"next       t={ts[0]}  ({pending[0].describe()})")
         print(f"missing at t={ts[0]}..{ts[-1]}")
     return 0

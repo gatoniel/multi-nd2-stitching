@@ -76,6 +76,11 @@ class Position:
            were never named (nd2 forbids adding one after acquisition, so
            there is no other way to resolve them). Files not listed still
            resolve by name as before; a tile can mix both across its files.
+    missing_in_files: file indices, within [start, end), where this tile has
+           no position at all -- an expected gap, not an error. The tile can
+           still be alive again in a later file; `drop` cannot express this,
+           since it only removes an already-resolved tile from a timepoint,
+           and resolution here would fail first.
     """
 
     start: tuple[int, int]
@@ -86,6 +91,9 @@ class Position:
     )
     position_in_files: dict[int, int] | None = attrs.field(
         factory=dict, converter=_none_to_dict
+    )
+    missing_in_files: list[int] | None = attrs.field(
+        factory=list, converter=_none_to_list
     )
 
     def alive_in_file(self, file_i: int, n_files: int) -> bool:
@@ -115,6 +123,8 @@ class Override:
                    neighbour correlation, same convention as shaped_peak)
       shaped_peak  pick the correlation peak by shape instead of raw height --
                    see StitchingConfig.shaped_peak_at
+      corner       fit and use a diagonal Corner as a placement edge -- see
+                   StitchingConfig.corner_at
 
     `unanchor` is what you want when a tile should keep its place in the mosaic
     while some *other* tile carries the drift across a timepoint. Two anchors in
@@ -137,6 +147,13 @@ class Override:
     `compute._windowed_peak_index`. Every key must also appear in
     `shaped_peak`; a hint with nothing to attach to is an error, not a
     silent no-op.
+
+    `corner` promotes a diagonal (`layout.Corner`) relationship into a real
+    placement edge, fitted by its own FFT correlation -- for a component with
+    no edge-adjacent path to an anchor at all. Always an `"a,b"` pair (a
+    corner has no drift-step equivalent, unlike `shaped_peak`/`realign`), and
+    -- for the same reason those are excluded from `names` -- so is this: it
+    adds a route, but names/drops/anchors nothing.
     """
 
     at: Timepoints
@@ -149,6 +166,7 @@ class Override:
     near: dict[str, list[int]] | None = attrs.field(
         factory=dict, converter=_none_to_dict
     )
+    corner: list[str] | None = attrs.field(factory=list, converter=_none_to_list)
 
     @property
     def names(self) -> set[str]:
@@ -219,6 +237,11 @@ class StitchingConfig:
             if t in o.at and name in o.near:
                 return tuple(o.near[name])
         return None
+
+    def corner_at(self, t: int) -> set[str]:
+        """'a,b' pair strings naming a Corner to fit and use as a placement
+        edge at this timepoint."""
+        return {n for o in self.overrides if t in o.at for n in o.corner}
 
 
 def loads_config(text: str) -> StitchingConfig:
