@@ -184,12 +184,17 @@ class PairTask:
 class CornerTask:
     """Offset between two diagonally-adjacent tiles at one global timepoint.
 
-    Unlike `PairTask`, there is no correlation axis to free -- a diagonal
-    pair only overlaps a small rectangle near the corner (the same one
-    `blend.py::_corner_taper` tapers for), not a full-length edge strip, so
-    both `crop_a` and `crop_b` restrict *both* lateral axes down to roughly
-    that rectangle, one crop per tile since each tile's own corner sits on
-    the opposite side of it.
+    Unlike `PairTask`, there is no single axis to free -- a diagonal pair's
+    overlap is a rectangle near the corner, not a full-length edge strip, so
+    both `crop_a` and `crop_b` restrict *both* lateral axes, each to a
+    `shift_px`-narrower band -- the same `n - shift_px` overlap-strip
+    convention `crop_for_alignment`/`trim_for` already use for a `Pair`,
+    just applied on both axes independently instead of one.
+
+    `nominal` is the mirror of `PairTask.shift_px`'s `offset[axis] +=
+    shift_px`: the crop only ever lets the correlation measure the
+    *correction* to the nominal `corner_direction` guess, not the tiles'
+    true origin-to-origin offset, so `run_task` adds `nominal` back.
     """
 
     a: str
@@ -199,6 +204,7 @@ class CornerTask:
     dst: VolumeRef
     crop_a: Crop
     crop_b: Crop
+    nominal: tuple[int, int, int]
     precision: str = "float32"
 
     kind = "corner"
@@ -212,6 +218,7 @@ class CornerTask:
                 self.dst.key(),
                 self.crop_a.key(),
                 self.crop_b.key(),
+                list(self.nominal),
                 self.precision,
             ]
         )
@@ -309,21 +316,30 @@ def file_keys(meta: Metadata) -> tuple[str, ...]:
     return tuple(_digest(attrs.asdict(FileStamp.of(f.path))) for f in meta.files)
 
 
-def _corner_crop(cfg, layout, meta, a: str, b: str, base: Crop) -> tuple[Crop, Crop]:
-    """`a`'s and `b`'s own crops for a CornerTask: each tile's own
-    `shift_px`-by-`shift_px` corner block, in the nominal direction of the
-    other -- the diagonal analogue of `crop.free_axis`, except here neither
-    axis can be freed (see `CornerTask`'s docstring), both are cropped down.
+def _corner_crop(
+    cfg, layout, meta, a: str, b: str, base: Crop
+) -> tuple[Crop, Crop, tuple[int, int, int]]:
+    """`a`'s and `b`'s own crops for a CornerTask, and the nominal offset to
+    add back to the raw correlation (see `CornerTask`'s docstring).
+
+    Both lateral axes get the same `n - shift_px` overlap-strip treatment
+    `crop_for_alignment`/`trim_for` already give a `Pair`'s one axis, just
+    independently on y and x: whichever side of `a` faces `b` keeps
+    `[shift_px, n)` (its `shift_px` near the boundary cut away), and `b`'s
+    matching side keeps `[0, n - shift_px)` -- the same physical strip, seen
+    from each tile's own local origin. z is untouched -- both tiles are
+    assumed nominally aligned there, same as an edge `Pair` never adjusts z.
     """
     dy_sign, dx_sign = corner_direction(cfg, meta, layout.tile, a, b)
     ny, nx, s = layout.ny, layout.nx, layout.shift_px
 
     def side(sign: int, extent: int) -> tuple[int, int]:
-        return (extent - s, extent) if sign > 0 else (0, s)
+        return (s, extent) if sign > 0 else (0, extent - s)
 
     crop_a = attrs.evolve(base, y=side(dy_sign, ny), x=side(dx_sign, nx))
     crop_b = attrs.evolve(base, y=side(-dy_sign, ny), x=side(-dx_sign, nx))
-    return crop_a, crop_b
+    nominal = (0, dy_sign * s, dx_sign * s)
+    return crop_a, crop_b, nominal
 
 
 def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Plan:
@@ -390,7 +406,9 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
             )
 
     corner_tasks = []
-    corner_crop_cache: dict[tuple[str, str], tuple[Crop, Crop]] = {}
+    corner_crop_cache: dict[
+        tuple[str, str], tuple[Crop, Crop, tuple[int, int, int]]
+    ] = {}
     for t in range(layout.nt):
         corner_at_t = cfg.corner_at(t)
         for c in layout.corners_at(t):
@@ -399,7 +417,7 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
             key = (c.a, c.b)
             if key not in corner_crop_cache:
                 corner_crop_cache[key] = _corner_crop(cfg, layout, meta, c.a, c.b, crop)
-            crop_a, crop_b = corner_crop_cache[key]
+            crop_a, crop_b, nominal = corner_crop_cache[key]
             corner_tasks.append(
                 CornerTask(
                     a=c.a,
@@ -409,6 +427,7 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                     dst=ref(c.b, t),
                     crop_a=crop_a,
                     crop_b=crop_b,
+                    nominal=nominal,
                     precision=precision,
                 )
             )

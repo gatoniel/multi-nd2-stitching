@@ -430,21 +430,48 @@ def test_run_task_near_none_passes_none_through(monkeypatch):
     assert captured["near"] is None
 
 
-def test_corner_task_recovers_a_known_offset():
-    """No axis, no shift_px addition -- the raw 3-component offset comes
-    back directly, same as a TimeTask's drift step."""
-    src, dst = _refs()
-    reader = FakeReader(shifts={dst: (0, 4, -6)})
+def test_corner_task_crop_and_reconstruction_recover_a_known_offset():
+    """The CornerTask equivalent of test_pair_task_total_offset -- a real
+    crop on both lateral axes, not (None, None, None). This is exactly the
+    test whose absence let a crop/reconstruction bug through undetected."""
+    rng = np.random.default_rng(0)
+    nz, ny, nx = 8, 40, 40
+    shift_px = 12
+    true_dy, true_dx = 12, -13  # dy_sign=+1, dx_sign=-1
+    dy_sign, dx_sign = 1, -1
+
+    # A large shared field; a and b are two overlapping windows into it,
+    # offset from each other by the true (known) corner displacement.
+    field = rng.random((nz, ny + 60, nx + 60))
+    ay0, ax0 = 30, 30
+    by0, bx0 = ay0 + true_dy, ax0 + true_dx
+
+    class SlicedReader:
+        def read(self, origin):
+            y0, x0 = origin
+            return field[:, y0 : y0 + ny, x0 : x0 + nx]
+
+    def side(sign, extent, s):
+        return (s, extent) if sign > 0 else (0, extent - s)
+
+    crop_a = Crop(
+        (None, None), side(dy_sign, ny, shift_px), side(dx_sign, nx, shift_px)
+    )
+    crop_b = Crop(
+        (None, None), side(-dy_sign, ny, shift_px), side(-dx_sign, nx, shift_px)
+    )
     task = CornerTask(
         a="a",
         b="b",
         t=0,
-        src=src,
-        dst=dst,
-        crop_a=Crop((None, None), (None, None), (None, None)),
-        crop_b=Crop((None, None), (None, None), (None, None)),
+        src=(ay0, ax0),
+        dst=(by0, bx0),
+        crop_a=crop_a,
+        crop_b=crop_b,
+        nominal=(0, dy_sign * shift_px, dx_sign * shift_px),
     )
-    assert run_task(task, Spectra(reader)) == Offset(0, -4, 6)
+    out = run_task(task, Spectra(SlicedReader()))
+    assert (out.dz, out.dy, out.dx) == (0, true_dy, true_dx)
 
 
 def test_unknown_task_type_is_loud():

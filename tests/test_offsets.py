@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import attrs
 import pytest
 import yaml
 from helpers import build, grid_meta, make_meta, stub_files
@@ -338,30 +339,35 @@ def test_corner_task_enabled_either_order(tmp_path, corner):
     assert len(p.corner_tasks) == 1
 
 
-def test_corner_task_crop_is_the_shift_px_cube(tmp_path):
+def test_corner_task_crop_is_the_overlap_strip(tmp_path):
+    """Same `n - shift_px` overlap-strip length crop_for_alignment/trim_for
+    already use for a Pair's one axis, here on both lateral axes at once --
+    not a `shift_px`-sized sliver at the tile's tip."""
     p, lay, _meta = _corner_plan(tmp_path, corner="b,c", nt=1)
     task = p.corner_tasks[0]
     s = lay.shift_px
     for crop in (task.crop_a, task.crop_b):
-        assert crop.y[1] - crop.y[0] == s
-        assert crop.x[1] - crop.x[0] == s
+        assert crop.y[1] - crop.y[0] == lay.ny - s
+        assert crop.x[1] - crop.x[0] == lay.nx - s
         assert crop.z == (None, lay.nz)  # full stack, no slices restriction given
 
 
-def test_corner_task_crops_are_on_opposite_sides(tmp_path):
-    """a's crop faces b, b's crop faces a -- opposite corners of each tile."""
+def test_corner_task_crops_are_the_same_physical_strip(tmp_path):
+    """a's crop faces b, b's crop faces a -- the same overlap strip, seen
+    from each tile's own local origin."""
     p, lay, meta = _corner_plan(tmp_path, corner="b,c", nt=1)
     task = p.corner_tasks[0]
     dy_sign, dx_sign = corner_direction(lay.config, meta, lay.tile, task.a, task.b)
     s = lay.shift_px
-    expect_a_y = (lay.ny - s, lay.ny) if dy_sign > 0 else (0, s)
-    expect_b_y = (0, s) if dy_sign > 0 else (lay.ny - s, lay.ny)
-    expect_a_x = (lay.nx - s, lay.nx) if dx_sign > 0 else (0, s)
-    expect_b_x = (0, s) if dx_sign > 0 else (lay.nx - s, lay.nx)
+    expect_a_y = (s, lay.ny) if dy_sign > 0 else (0, lay.ny - s)
+    expect_b_y = (0, lay.ny - s) if dy_sign > 0 else (s, lay.ny)
+    expect_a_x = (s, lay.nx) if dx_sign > 0 else (0, lay.nx - s)
+    expect_b_x = (0, lay.nx - s) if dx_sign > 0 else (s, lay.nx)
     assert task.crop_a.y == expect_a_y
     assert task.crop_b.y == expect_b_y
     assert task.crop_a.x == expect_a_x
     assert task.crop_b.x == expect_b_x
+    assert task.nominal == (0, dy_sign * s, dx_sign * s)
 
 
 def test_corner_task_key_changes_with_the_crop(tmp_path):
@@ -385,4 +391,14 @@ def test_corner_task_key_changes_with_the_crop(tmp_path):
         ),
         meta,
     ).corner_tasks[0]
+    assert task.key != other.key
+
+
+def test_corner_task_key_changes_with_nominal_alone(tmp_path):
+    """Even holding the crops fixed, a different nominal reconstruction is a
+    different result -- it has to be its own key ingredient, not just
+    implied by the crop bounds."""
+    p, _lay, _meta = _corner_plan(tmp_path, corner="b,c", nt=1)
+    task = p.corner_tasks[0]
+    other = attrs.evolve(task, nominal=tuple(v + 1 for v in task.nominal))
     assert task.key != other.key

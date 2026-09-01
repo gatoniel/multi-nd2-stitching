@@ -268,11 +268,14 @@ def run_task(task, spectra, workers: int = -1) -> Offset:
     fft1, _ = spectra.get(s1)
 
     if isinstance(task, CornerTask):
-        # Two different crops, one per tile, already narrowed to roughly the
-        # overlap rectangle -- no axis to free, no shaped_peak/near support
-        # yet (a corner correlation could plausibly want either later, but
-        # nothing requires it now), just the plain peak.
+        # Two different crops, one per tile, each narrowed to the same
+        # overlap strip on both lateral axes at once (see CornerTask's
+        # docstring) -- no shaped_peak/near support yet (a corner correlation
+        # could plausibly want either later, but nothing requires it now).
+        # The raw peak is only ever the correction to task.nominal, same
+        # reason PairTask adds shift_px back after the correlation.
         offset = phase_corr_from_ffts(fft0, fft1, shape, workers=workers)
+        offset = np.asarray(offset) + np.array(task.nominal)
         return Offset.of(offset)
 
     near = None
