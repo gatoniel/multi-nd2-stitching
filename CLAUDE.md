@@ -107,6 +107,25 @@ the same "opt-in and alive" gate `shaped_peak`/`realign` pairs already use.
 (pairs plus enabled, alive corners) or it will report a component the
 override genuinely connects as unanchored — the two must not drift apart.
 
+**A `CornerTask`'s two crops must be the same physical strip, not just
+"roughly the corner".** `blend.py`'s corner taper can get away with an
+oversized or off-centre band — a solo region is invisible to the
+normalized blend result either way. A correlation crop has no such safety
+net: if `crop_a` and `crop_b` don't correspond to the same real overlap,
+the FFT correlates two unrelated regions and returns a number with no
+error to signal it's wrong (confirmed by hand: an earlier version of
+`_corner_crop` used `blend.py`'s band directly and silently returned
+offsets nowhere near the true one). `_corner_crop` instead gives both
+crops the same `n - shift_px` overlap-strip convention
+`crop_for_alignment`/`trim_for` already use for a `Pair`'s one axis, just
+independently on both lateral axes. That crop only lets the correlation
+measure the *correction* to the nominal `corner_direction` guess it
+encodes, not the tiles' true offset, so `run_task` has to add
+`CornerTask.nominal` back afterward — the two-axis analogue of
+`PairTask`'s `offset[axis] += shift_px`. A `CornerTask` built with no real
+crop (e.g. `(None, None, None)` in a test) exercises none of this; it
+proves only that the dispatch runs, not that the offset is right.
+
 **Per-timepoint blend work is bounded by the bounding box, not the canvas.**
 A whole-canvas `np.divide` costs in proportion to the canvas, which makes
 padding ruinously expensive. Same for zarr writes: they must start on chunk
