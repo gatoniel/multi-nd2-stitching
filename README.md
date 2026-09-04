@@ -137,6 +137,34 @@ and uses it as a real placement edge, for exactly the timepoints listed:
   corner: ["ch5_b,ch5_d"]
 ```
 
+### Overview image
+
+A separate, low-magnification `overview.nd2` can be marked up with each
+tile's stage position and saved as a PNG, to orient the stitched tiles within
+the wider sample:
+
+```yaml
+overview:
+  file: /data/overview.nd2
+  channel: 0                # index into overview.nd2's own P axis, not a
+                             # name -- omit if the file has only one position
+  pixel_size_um: 0.65        # overrides a wrong header pixel size; optional
+  max_output_px: 2000         # longer side of the PNG; downsample factor is
+                               # derived from this, never picked by hand
+  reduction: mean             # or "median" -- how the image is shrunk
+  label: true                  # draw tile names next to the markers
+```
+
+The overview plane is read once at full resolution (ND2 has no windowed
+read), then shrunk by block mean/median in bounded chunks -- never a strided
+slice (`arr[::N]`), which is what previously crashed the process outright on
+a large overview under Python 3.14.7, with no traceback (the OS OOM-killed
+it; only `dmesg` showed why).
+
+```bash
+stitch overview ch5.yaml
+```
+
 ## Commands
 
 | command | what it does |
@@ -150,6 +178,7 @@ and uses it as a real placement edge, for exactly the timepoints listed:
 | `stitch blend` | composite onto a zarr canvas |
 | `stitch inspect --at T` | export a neighbour pair for visual inspection |
 | `stitch drift --tile X` | export one tile's drift over time |
+| `stitch overview` | PNG of a wide overview image with tile positions marked |
 
 ### Validation, in three tiers
 

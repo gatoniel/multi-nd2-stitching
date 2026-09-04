@@ -1,6 +1,6 @@
 import pytest
 
-from multi_nd2_stitching.validate import ConfigError, check, validate
+from multi_nd2_stitching.validate import ConfigError, check, check_overview, validate
 
 
 def test_minimal_is_valid(cfg_dict, parse):
@@ -383,18 +383,95 @@ def test_no_overview_is_fine(cfg_dict, parse):
 
 
 def test_overview_with_file_and_channel_is_fine(cfg_dict, parse):
-    cfg_dict["overview"] = {"file": "overview.nd2", "channel": "pos1"}
+    cfg_dict["overview"] = {"file": "overview.nd2", "channel": 1}
     assert check(parse(cfg_dict)) == []
 
 
-def test_overview_empty_channel_is_flagged(cfg_dict, parse):
-    cfg_dict["overview"] = {"file": "overview.nd2", "channel": ""}
+def test_overview_without_channel_is_fine_at_tier_one(cfg_dict, parse):
+    # Whether an unset channel is actually OK depends on how many positions
+    # the file has -- that needs a read, so it's `check_overview`'s job, not
+    # this tier's.
+    cfg_dict["overview"] = {"file": "overview.nd2"}
+    assert check(parse(cfg_dict)) == []
+
+
+def test_overview_negative_channel_is_flagged(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "overview.nd2", "channel": -1}
     problems = check(parse(cfg_dict))
     assert any("overview.channel" in p for p in problems), problems
 
 
+def test_overview_bad_reduction_is_flagged(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "overview.nd2", "reduction": "max"}
+    problems = check(parse(cfg_dict))
+    assert any("overview.reduction" in p for p in problems), problems
+
+
+def test_overview_non_positive_max_output_px_is_flagged(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "overview.nd2", "max_output_px": 0}
+    problems = check(parse(cfg_dict))
+    assert any("overview.max_output_px" in p for p in problems), problems
+
+
 def test_overview_missing_file_is_flagged_only_with_check_files(cfg_dict, parse):
-    cfg_dict["overview"] = {"file": "does-not-exist.nd2", "channel": "pos1"}
+    cfg_dict["overview"] = {"file": "does-not-exist.nd2", "channel": 1}
     assert check(parse(cfg_dict)) == []
     problems = check(parse(cfg_dict), check_files=True)
     assert any("overview.file" in p for p in problems), problems
+
+
+# --- check_overview (deep tier: opens the overview file) -----------------------
+def test_check_overview_skips_when_no_overview(cfg_dict, parse):
+    assert check_overview(parse(cfg_dict)) == []
+
+
+def test_check_overview_skips_when_file_does_not_exist(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "does-not-exist.nd2", "channel": 1}
+    assert check_overview(parse(cfg_dict)) == []
+
+
+def test_check_overview_requires_a_channel_for_multiple_positions(
+    cfg_dict, parse, monkeypatch, tmp_path
+):
+    from helpers import make_meta
+
+    f = tmp_path / "overview.nd2"
+    f.write_bytes(b"x")
+    cfg_dict["overview"] = {"file": str(f)}
+    meta = make_meta(n_files=1, tiles=("p0", "p1"))[0]
+    monkeypatch.setattr(
+        "multi_nd2_stitching.overview.read_overview_meta", lambda path: meta
+    )
+    problems = check_overview(parse(cfg_dict))
+    assert any("must choose one" in p for p in problems), problems
+
+
+def test_check_overview_flags_out_of_range_channel(
+    cfg_dict, parse, monkeypatch, tmp_path
+):
+    from helpers import make_meta
+
+    f = tmp_path / "overview.nd2"
+    f.write_bytes(b"x")
+    cfg_dict["overview"] = {"file": str(f), "channel": 5}
+    meta = make_meta(n_files=1, tiles=("p0", "p1"))[0]
+    monkeypatch.setattr(
+        "multi_nd2_stitching.overview.read_overview_meta", lambda path: meta
+    )
+    problems = check_overview(parse(cfg_dict))
+    assert any("out of range" in p for p in problems), problems
+
+
+def test_check_overview_fine_with_a_valid_channel(
+    cfg_dict, parse, monkeypatch, tmp_path
+):
+    from helpers import make_meta
+
+    f = tmp_path / "overview.nd2"
+    f.write_bytes(b"x")
+    cfg_dict["overview"] = {"file": str(f), "channel": 0}
+    meta = make_meta(n_files=1, tiles=("p0", "p1"))[0]
+    monkeypatch.setattr(
+        "multi_nd2_stitching.overview.read_overview_meta", lambda path: meta
+    )
+    assert check_overview(parse(cfg_dict)) == []

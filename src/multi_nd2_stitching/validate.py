@@ -266,6 +266,7 @@ def _check_timeline(cfg: StitchingConfig, nts, p: list[str]) -> None:
 
 
 def _check_overview(cfg: StitchingConfig, p: list[str], check_files: bool) -> None:
+    """Tier 1: whatever the config alone can say, no ND2 opened."""
     ov = cfg.overview
     if ov is None:
         return
@@ -273,8 +274,35 @@ def _check_overview(cfg: StitchingConfig, p: list[str], check_files: bool) -> No
         p.append("overview.file: empty")
     elif check_files and not Path(ov.file).exists():
         p.append(f"overview.file: {ov.file} does not exist")
-    if not ov.channel:
-        p.append("overview.channel: empty")
+    if ov.channel is not None and ov.channel < 0:
+        p.append("overview.channel: must be >= 0")
+    if ov.reduction not in ("mean", "median"):
+        p.append(f"overview.reduction: {ov.reduction!r} must be 'mean' or 'median'")
+    if ov.max_output_px <= 0:
+        p.append("overview.max_output_px: must be > 0")
+
+
+def check_overview(cfg: StitchingConfig) -> list[str]:
+    """Deep tier: open the overview file and check `channel` against its P axis.
+
+    Mirrors `check_layout`/`check_corner`'s "own public function, called
+    alongside the others once files are readable" shape. Silently skipped
+    (not an error) if there's no overview file or it doesn't exist yet --
+    `_check_overview`'s tier-1 checks already cover those.
+    """
+    ov = cfg.overview
+    if ov is None or not ov.file or not Path(ov.file).exists():
+        return []
+
+    from .overview import read_overview_meta
+
+    n = len(read_overview_meta(ov.file).stage_um)
+    p: list[str] = []
+    if n > 1 and ov.channel is None:
+        p.append(f"overview.channel: {n} positions, must choose one (0..{n - 1})")
+    elif ov.channel is not None and ov.channel >= n:
+        p.append(f"overview.channel: {ov.channel} is out of range (0..{n - 1})")
+    return p
 
 
 def check(cfg: StitchingConfig, nts=None, check_files: bool = False) -> list[str]:

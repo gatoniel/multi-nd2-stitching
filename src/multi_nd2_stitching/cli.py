@@ -12,7 +12,9 @@ import argparse
 import sys
 from pathlib import Path
 
-from .config import load_config
+import attrs
+
+from .config import Overview, load_config
 from .layout import build_layout
 from .metadata import load_metadata
 from .offsets import TimeTask, build_plan, file_keys
@@ -21,6 +23,7 @@ from .validate import (
     check,
     check_corner,
     check_layout,
+    check_overview,
     check_realign,
     check_shaped_peak,
 )
@@ -55,7 +58,8 @@ def _prepare(args, *, need_metadata: bool):
         + check_layout(layout)
         + check_shaped_peak(layout)
         + check_realign(layout)
-        + check_corner(layout),
+        + check_corner(layout)
+        + check_overview(cfg),
         str(args.config),
     )
     return ws, cfg, meta, layout
@@ -563,45 +567,58 @@ def cmd_times(args) -> int:
 
 
 def cmd_overview(args) -> int:
-    from .metadata import read_metadata
-    from .overview import (
-        marker_positions,
-        normalize_to_uint8,
-        read_overview_plane,
-        render_overview,
-    )
+    from .overview import build_overview, read_overview_meta
 
     ws, cfg, meta, _layout = _prepare(args, need_metadata=True)
 
-    overview_file = args.overview_file or (cfg.overview and cfg.overview.file)
-    channel = args.channel or (cfg.overview and cfg.overview.channel)
-    label = cfg.overview.label if cfg.overview else True
-    if not overview_file or not channel:
+    base = cfg.overview or Overview(file="")
+    ov = attrs.evolve(
+        base,
+        file=str(args.overview_file) if args.overview_file else base.file,
+        channel=args.channel if args.channel is not None else base.channel,
+        pixel_size_um=(
+            args.pixel_size_um if args.pixel_size_um is not None else base.pixel_size_um
+        ),
+        max_output_px=args.max_output_px or base.max_output_px,
+        reduction=args.reduction or base.reduction,
+    )
+    if not ov.file:
         print(
-            "overview: need a file and a channel, from overview: in the config "
-            "or --overview-file/--channel",
+            "overview: need a file, from overview.file in the config "
+            "or --overview-file",
             file=sys.stderr,
         )
         return 1
 
-    overview_meta = read_metadata([overview_file])[0]
-    idx = overview_meta.position_of((channel,))
-    if idx is None:
+    n_positions = len(read_overview_meta(ov.file).stage_um)
+    if ov.channel is not None and not 0 <= ov.channel < n_positions:
         print(
-            f"'{channel}' is not a position in {overview_file}; "
-            f"known: {overview_meta.position_names}",
+            f"channel {ov.channel} is out of range for {ov.file} "
+            f"({n_positions} position(s))",
+            file=sys.stderr,
+        )
+        return 1
+    if ov.channel is None and n_positions > 1:
+        print(
+            f"overview: {ov.file} has {n_positions} positions; pass "
+            f"--channel 0..{n_positions - 1}",
             file=sys.stderr,
         )
         return 1
 
-    markers = marker_positions(cfg, meta, overview_meta, channel)
-    plane = read_overview_plane(overview_file, idx)
-    image = normalize_to_uint8(plane)
+    progress = None
+    if not args.no_progress:
+        try:
+            from tqdm import tqdm
+
+            progress = lambda xs: tqdm(xs, unit="block", desc="downsampling")
+        except ImportError:
+            pass
 
     out = args.out or (ws.root / "overview.png")
-    render_overview(image, markers, out, label=label)
+    markers = build_overview(cfg, meta, ov, out, progress=progress)
     print(f"wrote      {out}")
-    print(f"markers    {len(markers)} tile(s) at position '{channel}'")
+    print(f"markers    {len(markers)} tile(s)")
     return 0
 
 
@@ -911,10 +928,24 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     ov.add_argument(
-        "--channel", help="XY position name in overview.nd2; overrides overview.channel"
+        "--channel",
+        type=int,
+        help="index into overview.nd2's P axis; overrides overview.channel",
     )
     ov.add_argument("--overview-file", type=Path, help="overrides overview.file")
+    ov.add_argument(
+        "--pixel-size-um", type=float, help="overrides overview.pixel_size_um"
+    )
+    ov.add_argument(
+        "--max-output-px", type=int, help="overrides overview.max_output_px"
+    )
+    ov.add_argument(
+        "--reduction",
+        choices=("mean", "median"),
+        help="overrides overview.reduction",
+    )
     ov.add_argument("--out", type=Path, help="defaults to <workspace>/overview.png")
+    ov.add_argument("--no-progress", action="store_true")
     ov.set_defaults(func=cmd_overview)
     return ap
 

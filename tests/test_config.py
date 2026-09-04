@@ -309,13 +309,36 @@ def test_clamp_z_leaves_yx_alone():
 
 # --- overview -------------------------------------------------------------------
 def test_overview_present(cfg_dict, parse):
-    cfg_dict["overview"] = {"file": "overview.nd2", "channel": "pos1"}
+    cfg_dict["overview"] = {"file": "overview.nd2", "channel": 1}
     ov = parse(cfg_dict).overview
     assert ov.file == "overview.nd2"
-    assert ov.channel == "pos1"
+    assert ov.channel == 1
     assert ov.label is True
+    assert ov.pixel_size_um is None
+    assert ov.max_output_px == 2000
+    assert ov.reduction == "mean"
+
+
+def test_overview_channel_defaults_to_none(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "overview.nd2"}
+    assert parse(cfg_dict).overview.channel is None
 
 
 def test_overview_label_can_be_disabled(cfg_dict, parse):
-    cfg_dict["overview"] = {"file": "o.nd2", "channel": "p1", "label": False}
+    cfg_dict["overview"] = {"file": "o.nd2", "channel": 1, "label": False}
     assert parse(cfg_dict).overview.label is False
+
+
+def test_overview_pixel_size_override(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "o.nd2", "pixel_size_um": 0.65}
+    assert parse(cfg_dict).overview.pixel_size_um == 0.65
+
+
+def test_overview_max_output_px_override(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "o.nd2", "max_output_px": 4000}
+    assert parse(cfg_dict).overview.max_output_px == 4000
+
+
+def test_overview_reduction_override(cfg_dict, parse):
+    cfg_dict["overview"] = {"file": "o.nd2", "reduction": "median"}
+    assert parse(cfg_dict).overview.reduction == "median"

@@ -177,14 +177,22 @@ class Override:
 class Overview:
     """A wide-field image to orient the stitched tiles within.
 
-    `channel` names an entry in overview.nd2's own multipoint experiment --
-    the same lookup `FileMeta.position_of` does for the tile files -- not a
-    fluorescence channel.
+    `channel` is a direct index into overview.nd2's own P axis -- unlike tile
+    positions, which are matched by name, the overview file's positions are
+    picked by number. `None` when the file has no P axis at all, or exactly
+    one. Not a fluorescence channel.
     """
 
     file: str
-    channel: str
+    channel: int | None = None
     label: bool = True
+    # Overrides overview.nd2's own (possibly wrong) header pixel size.
+    pixel_size_um: float | None = None
+    # Longer side of the exported PNG, in px; the downsample factor is derived
+    # from this, never picked by hand.
+    max_output_px: int = 2000
+    # "mean" or "median" block-reduce; validated in validate.py.
+    reduction: str = "mean"
 
 
 @attrs.define(kw_only=True)
