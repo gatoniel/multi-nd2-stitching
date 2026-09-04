@@ -29,6 +29,7 @@ def test_position_optional_absent(cfg_dict, parse, field, expected):
         ("overrides", []),
         ("overview", None),
         ("stop_at", None),
+        ("exclude_at", ()),
     ],
 )
 def test_toplevel_optional_absent(cfg_dict, parse, field, expected):
@@ -42,6 +43,7 @@ def test_toplevel_optional_absent(cfg_dict, parse, field, expected):
         ("shift_px", None),
         ("overview", None),
         ("stop_at", None),
+        ("exclude_at", ()),
     ],
 )
 def test_toplevel_optional_explicit_null(cfg_dict, parse, field, expected):
@@ -52,6 +54,11 @@ def test_toplevel_optional_explicit_null(cfg_dict, parse, field, expected):
 def test_stop_at_present(cfg_dict, parse):
     cfg_dict["stop_at"] = 143
     assert parse(cfg_dict).stop_at == 143
+
+
+def test_exclude_at_present(cfg_dict, parse):
+    cfg_dict["exclude_at"] = [4, 16, "20-22"]
+    assert parse(cfg_dict).exclude_at == (4, 16, 20, 21, 22)
 
 
 # --- explicit YAML null must behave like absent -------------------------------

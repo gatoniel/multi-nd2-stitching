@@ -131,6 +131,22 @@ A whole-canvas `np.divide` costs in proportion to the canvas, which makes
 padding ruinously expensive. Same for zarr writes: they must start on chunk
 boundaries or zarr read-modify-writes every partial chunk.
 
+**Two timepoint numberings exist, and nothing may mix them.** `Override.at`,
+`stop_at`, and `exclude_at` are all *raw* global timepoints -- counted
+straight off the concatenated files, unaffected by what `exclude_at` itself
+removes, so editing one config field never silently renumbers another.
+`layout.nt` and everything that loops over it (`placement.py`,
+`build_plan`, `build_coordinates`, `blend`, `times`, every CLI `--at`/
+`--between`) are in the *compacted* numbering `build_layout` produces by
+deleting excluded rows outright -- not masking them -- which is what makes
+a drift step spanning a gap just an ordinary `t-1 -> t` step against
+whatever real timepoint is now adjacent, with no special-casing anywhere
+downstream. Any code that reads `Override.at` (or calls
+`shaped_peak_at`/`realigned_at`/`corner_at`/`near_hint`) against a
+compacted array or compacted loop variable has to translate through
+`layout.raw_t`/`layout.raw_to_t` first, or it reads the wrong row -- or, if
+the excluded count differs, indexes out of range.
+
 ## Conventions
 
 - attrs classes, `@attrs.frozen` where possible. cattrs for YAML and JSON.
@@ -167,6 +183,16 @@ boundaries or zarr read-modify-writes every partial chunk.
   truncation is free everywhere except code that loops over `cfg.n_files`
   directly (`stitch timeline`'s per-file table has to skip files whose start
   is past it, or `tiles_at()` indexes straight past the truncated mask).
+- `exclude_at` removes whole raw timepoints from the *middle* of the
+  timeline, not just the tail -- no tile, no canvas frame, no `times` row,
+  and a drift step whose anchor is alive on both sides of the gap
+  correlates directly across it (a jump, logged in `TimeTask.raw_gap` /
+  `describe()`) rather than against the missing frames. `layout.nt` is the
+  *compacted* count afterward; `layout.stop_nt` is what `nt` meant before
+  `exclude_at` existed, kept around only so `stitch timeline`/`validate` can
+  still report the stop_at truncation on its own. See the "two timepoint
+  numberings" invariant above before touching anything that reads
+  `Override.at` near this.
 - Drift is absolute: placing timepoint `t` needs every drift step from 0.
   Pair offsets are local to their timepoint.
 - `Override.near`'s `[dz, dy, dx]` is in *measured* (final-offset) space --

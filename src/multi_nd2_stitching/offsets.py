@@ -88,7 +88,14 @@ class SpectrumRef:
 
 @attrs.frozen
 class TimeTask:
-    """Drift of one anchor tile between two consecutive global timepoints."""
+    """Drift of one anchor tile between two consecutive *compacted*
+    timepoints -- `t_from`/`t_to` are always exactly one apart in this
+    numbering, even when exclude_at has cut raw timepoints out of the gap
+    between them. `raw_gap` records how many raw timepoints that really was
+    (1 when nothing was excluded there); it is purely informational -- not
+    part of `key`, since it is derived from t alone and not from the pixels
+    being correlated, the same reason a comment never belongs in the key.
+    """
 
     name: str
     t_from: int
@@ -100,6 +107,7 @@ class TimeTask:
     realign: bool = False
     shaped_peak: bool = False
     near: tuple[int, int, int] | None = None
+    raw_gap: int = 1
 
     kind = "time"
 
@@ -126,6 +134,7 @@ class TimeTask:
     def describe(self) -> str:
         tag = " (realign)" if self.realign else ""
         tag += " (shaped)" if self.shaped_peak else ""
+        tag += f" (jump over {self.raw_gap - 1} excluded)" if self.raw_gap > 1 else ""
         return f"time {self.name} {self.t_from}->{self.t_to}{tag}"
 
 
@@ -354,6 +363,10 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
         _, local_t = layout.locate(t)
         return VolumeRef(fkeys[file_i], pos, local_t, layout.nz)
 
+    # Override.at (and thus everything cfg.*_at reads) is in raw global-
+    # timepoint numbering; `t` below is the compacted one layout.nt loops
+    # over, so every lookup against the config translates through raw_t
+    # first -- see StitchingConfig.exclude_at.
     time_tasks = []
     for i, name in enumerate(layout.tiles):
         for t in range(1, layout.nt):
@@ -361,7 +374,8 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                 continue
             if not layout.tile_alive[t - 1, i]:
                 continue  # nothing to drift from; check_layout reports this
-            realign = name in cfg.realigned_at(t)
+            raw_t = layout.raw_t[t]
+            realign = name in cfg.realigned_at(raw_t)
             time_tasks.append(
                 TimeTask(
                     name=name,
@@ -372,15 +386,17 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                     crop=realign_crop if realign else crop,
                     precision=precision,
                     realign=realign,
-                    shaped_peak=name in cfg.shaped_peak_at(t),
-                    near=cfg.near_hint(name, t),
+                    shaped_peak=name in cfg.shaped_peak_at(raw_t),
+                    near=cfg.near_hint(name, raw_t),
+                    raw_gap=raw_t - layout.raw_t[t - 1],
                 )
             )
 
     pair_tasks = []
     for t in range(layout.nt):
-        shaped_at_t = cfg.shaped_peak_at(t)
-        realign_at_t = cfg.realigned_at(t)
+        raw_t = layout.raw_t[t]
+        shaped_at_t = cfg.shaped_peak_at(raw_t)
+        realign_at_t = cfg.realigned_at(raw_t)
         for p in layout.pairs_at(t):
             realign = f"{p.a},{p.b}" in realign_at_t or f"{p.b},{p.a}" in realign_at_t
             pair_tasks.append(
@@ -398,8 +414,8 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
                         f"{p.a},{p.b}" in shaped_at_t or f"{p.b},{p.a}" in shaped_at_t
                     ),
                     near=(
-                        cfg.near_hint(f"{p.a},{p.b}", t)
-                        or cfg.near_hint(f"{p.b},{p.a}", t)
+                        cfg.near_hint(f"{p.a},{p.b}", raw_t)
+                        or cfg.near_hint(f"{p.b},{p.a}", raw_t)
                     ),
                     realign=realign,
                 )
@@ -410,7 +426,7 @@ def build_plan(layout: Layout, meta: Metadata, precision: str = "float32") -> Pl
         tuple[str, str], tuple[Crop, Crop, tuple[int, int, int]]
     ] = {}
     for t in range(layout.nt):
-        corner_at_t = cfg.corner_at(t)
+        corner_at_t = cfg.corner_at(layout.raw_t[t])
         for c in layout.corners_at(t):
             if f"{c.a},{c.b}" not in corner_at_t and f"{c.b},{c.a}" not in corner_at_t:
                 continue

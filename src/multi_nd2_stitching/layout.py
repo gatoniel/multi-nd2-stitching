@@ -59,9 +59,17 @@ class Layout:
     pairs: tuple[Pair, ...]
     corners: tuple[Corner, ...]
     nts: tuple[int, ...]
-    file_start: tuple[int, ...]  # global t at which each file begins
-    nt: int
-    raw_nt: int  # nt before any stop_at truncation; nt itself for reporting only
+    file_start: tuple[int, ...]  # RAW global t at which each file begins
+    nt: int  # the compacted timeline length -- everything downstream loops over this
+    raw_nt: int  # total raw timepoints across files, before stop_at or exclude_at
+    stop_nt: int  # raw_nt after stop_at alone; what `nt` meant before exclude_at
+    # compacted t -> raw global t (length nt). Identity when exclude_at is
+    # unused. `Override.at`/`stop_at`/`exclude_at` are all in raw numbering,
+    # so anything reading them against a compacted array or loop variable
+    # has to translate through this first -- see build_plan, plan_placement.
+    raw_t: tuple[int, ...]
+    raw_to_t: dict[int, int]  # inverse of raw_t; a raw t missing here never survived
+    excluded: tuple[int, ...]  # raw t's actually removed by exclude_at, sorted
     nz: int  # min stack depth across files
     ny: int
     nx: int
@@ -79,8 +87,9 @@ class Layout:
         """Global timepoint -> (file index, timepoint within that file)."""
         if not 0 <= t < self.nt:
             raise IndexError(f"t={t} outside timeline 0..{self.nt - 1}")
-        file_i = int(np.searchsorted(self.file_start, t, side="right") - 1)
-        return file_i, t - self.file_start[file_i]
+        raw = self.raw_t[t]
+        file_i = int(np.searchsorted(self.file_start, raw, side="right") - 1)
+        return file_i, raw - self.file_start[file_i]
 
     def tiles_at(self, t: int) -> list[str]:
         return [n for i, n in enumerate(self.tiles) if self.tile_alive[t, i]]
@@ -226,7 +235,12 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
     # build_plan, coordinates, blend -- ever sees a timepoint past it. They
     # all already loop over `layout.nt`, never raw metadata, so this one
     # change is enough; no per-module truncation logic needed anywhere else.
-    nt = raw_nt if cfg.stop_at is None else min(raw_nt, cfg.stop_at)
+    #
+    # exclude_at goes one step further and removes whole timepoints from the
+    # *middle* of the timeline, not just the tail -- see the compaction below,
+    # after the masks are built. `stop_nt` is the boundary exclude_at itself
+    # is checked against.
+    stop_nt = raw_nt if cfg.stop_at is None else min(raw_nt, cfg.stop_at)
 
     # --- tiles ------------------------------------------------------------
     tiles = tuple(sorted(cfg.positions))
@@ -284,7 +298,7 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
             name=name,
             aliases=names,
             first_t=file_start[pos.start[0]] + pos.start[1],
-            last_t=nt
+            last_t=stop_nt
             if pos.end is None
             else file_start[end_file - 1] + nts[end_file - 1],
             position=position,
@@ -293,9 +307,12 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
     pairs = _discover_pairs(cfg, meta, tile)
     corners = _discover_corners(cfg, meta, tile)
 
-    # --- masks ------------------------------------------------------------
-    tile_alive = np.zeros((nt, len(tiles)), dtype=bool)
-    is_anchor = np.zeros((nt, len(tiles)), dtype=bool)
+    # --- masks --------------------------------------------------------------
+    # Built over the RAW (post stop_at, pre exclude_at) timeline -- Override.at
+    # and Position/reference_in_files indices are all raw, so this stays raw
+    # too. exclude_at compacts the result below, once everything raw is done.
+    tile_alive = np.zeros((stop_nt, len(tiles)), dtype=bool)
+    is_anchor = np.zeros((stop_nt, len(tiles)), dtype=bool)
     for i, name in enumerate(tiles):
         tile_alive[tile[name].first_t : tile[name].last_t, i] = True
         # A gap cut out of that otherwise-contiguous range -- the tile can be
@@ -322,6 +339,21 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
             for name in o.anchor:
                 is_anchor[t, tiles.index(name)] = True
     is_anchor &= tile_alive
+
+    # --- exclude_at: compact whole timepoints out of the timeline -----------
+    # A raw t outside [0, stop_nt) has no row above to remove and is simply
+    # ignored here -- validate.py flags it as a no-op config problem instead.
+    excluded = tuple(sorted({t for t in cfg.exclude_at if 0 <= t < stop_nt}))
+    if excluded:
+        kept_mask = np.ones(stop_nt, dtype=bool)
+        kept_mask[list(excluded)] = False
+        tile_alive = tile_alive[kept_mask]
+        is_anchor = is_anchor[kept_mask]
+        raw_t = tuple(int(r) for r in np.nonzero(kept_mask)[0])
+    else:
+        raw_t = tuple(range(stop_nt))
+    raw_to_t = {r: t for t, r in enumerate(raw_t)}
+    nt = len(raw_t)
 
     pair_alive = np.zeros((nt, len(pairs)), dtype=bool)
     for k, p in enumerate(pairs):
@@ -351,6 +383,10 @@ def build_layout(cfg: StitchingConfig, meta: Metadata) -> Layout:
         file_start=file_start,
         nt=nt,
         raw_nt=raw_nt,
+        stop_nt=stop_nt,
+        raw_t=raw_t,
+        raw_to_t=raw_to_t,
+        excluded=excluded,
         nz=min(f.nz for f in meta.files),
         ny=nys.pop(),
         nx=nxs.pop(),

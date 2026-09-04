@@ -215,6 +215,21 @@ class StitchingConfig:
     # run, as if the files were shorter. For the tail after an experiment
     # ends but imaging continues; unset, the whole timeline is used.
     stop_at: int | None = None
+    # Raw global timepoints (same numbering as stop_at and Override.at --
+    # i.e. counted straight off the concatenated files, unaffected by any
+    # exclusion) that are cut out of the timeline entirely: no tile, no
+    # canvas frame, no `times` row. Unlike `drop`, which removes one tile
+    # from an otherwise-real timepoint, this removes the timepoint itself --
+    # for the case where *nothing* at it is worth keeping. Everything
+    # downstream is renumbered around the gap, so `layout.nt` (and every t
+    # a command like `stitch graph --at` or `stitch blend --between`
+    # addresses) counts only the timepoints that survive; a tile's drift
+    # step across the gap correlates directly against the last surviving
+    # timepoint rather than the missing ones, which is the point -- a jump
+    # is preferable to correlating against blank frames. `at:` in overrides
+    # stays in this same raw numbering regardless of what exclude_at
+    # removes, so edits to one never renumber the other.
+    exclude_at: Timepoints = attrs.field(factory=tuple)
 
     @property
     def n_files(self) -> int:

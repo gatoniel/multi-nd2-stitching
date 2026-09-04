@@ -277,6 +277,56 @@ def test_stop_at_does_not_relieve_a_file_of_needing_a_reference(cfg_dict, parse)
     assert any("have no reference position" in p for p in problems), problems
 
 
+# --- exclude_at ---------------------------------------------------------------
+def test_exclude_at_negative_timepoint_is_flagged(cfg_dict, parse):
+    cfg_dict["exclude_at"] = [-1]
+    problems = check(parse(cfg_dict))
+    assert any("negative timepoint -1" in p for p in problems), problems
+
+
+def test_exclude_at_duplicates_are_flagged(cfg_dict, parse):
+    cfg_dict["exclude_at"] = [3, 3]
+    problems = check(parse(cfg_dict))
+    assert any("contains duplicates" in p for p in problems), problems
+
+
+def test_exclude_at_clean_is_fine_without_nts(cfg_dict, parse):
+    cfg_dict["exclude_at"] = [3, 4]
+    assert check(parse(cfg_dict)) == []
+
+
+def test_exclude_at_beyond_timeline_is_flagged(cfg_dict, parse):
+    cfg_dict["exclude_at"] = [99999]
+    problems = check(parse(cfg_dict), nts=[10, 10])
+    assert any("beyond timeline (nt=20)" in p for p in problems), problems
+
+
+def test_exclude_at_within_timeline_is_fine(cfg_dict, parse):
+    cfg_dict["exclude_at"] = [3, 4]
+    assert check(parse(cfg_dict), nts=[10, 10]) == []
+
+
+def test_exclude_at_removing_everything_is_flagged(cfg_dict, parse):
+    cfg_dict["exclude_at"] = list(range(20))
+    problems = check(parse(cfg_dict), nts=[10, 10])
+    assert any("removes the entire timeline" in p for p in problems), problems
+
+
+def test_exclude_at_flags_an_override_it_swallows(cfg_dict, parse):
+    cfg_dict["exclude_at"] = [3]
+    cfg_dict["overrides"] = [{"at": 3, "drop": ["tile_b"]}]
+    problems = check(parse(cfg_dict), nts=[10, 10])
+    assert any(
+        "overrides[0].at: timepoint(s) 3 excluded by exclude_at" in p for p in problems
+    ), problems
+
+
+def test_exclude_at_leaves_an_override_elsewhere_alone(cfg_dict, parse):
+    cfg_dict["exclude_at"] = [3]
+    cfg_dict["overrides"] = [{"at": 4, "drop": ["tile_b"]}]
+    assert check(parse(cfg_dict), nts=[10, 10]) == []
+
+
 def test_timeline_catches_override_on_dead_tile(cfg_dict, parse):
     cfg_dict["positions"]["tile_b"] = {"start": [0, 0], "end": 1}
     cfg_dict["overrides"] = [{"at": 15, "drop": ["tile_b"]}]

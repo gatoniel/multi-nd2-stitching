@@ -226,6 +226,14 @@ def _check_overrides(cfg: StitchingConfig, p: list[str]) -> None:
             )
 
 
+def _check_exclude(cfg: StitchingConfig, p: list[str]) -> None:
+    for t in cfg.exclude_at:
+        if t < 0:
+            p.append(f"exclude_at: negative timepoint {t}")
+    if len(set(cfg.exclude_at)) != len(cfg.exclude_at):
+        p.append("exclude_at: contains duplicates")
+
+
 def _check_timeline(cfg: StitchingConfig, nts, p: list[str]) -> None:
     if len(nts) != cfg.n_files:
         p.append(f"timeline: got {len(nts)} file lengths for {cfg.n_files} files")
@@ -233,6 +241,24 @@ def _check_timeline(cfg: StitchingConfig, nts, p: list[str]) -> None:
     starts = [sum(nts[:i]) for i in range(cfg.n_files)]
     raw_nt = sum(nts)
     nt = raw_nt if cfg.stop_at is None else min(raw_nt, cfg.stop_at)
+
+    beyond = sorted(t for t in cfg.exclude_at if t >= nt)
+    if beyond:
+        p.append(
+            f"exclude_at: timepoint(s) {_ranges(beyond)} beyond timeline (nt={nt}); "
+            "no effect"
+        )
+    excluded = sorted({t for t in cfg.exclude_at if 0 <= t < nt})
+    if excluded and len(excluded) >= nt:
+        p.append("exclude_at: removes the entire timeline")
+    excluded_set = set(excluded)
+    for i, o in enumerate(cfg.overrides):
+        hit = sorted(t for t in o.at if t in excluded_set)
+        if hit:
+            p.append(
+                f"overrides[{i}].at: timepoint(s) {_ranges(hit)} excluded by "
+                "exclude_at; this override has no effect there"
+            )
 
     for name, pos in cfg.positions.items():
         f0, t0 = pos.start
@@ -330,6 +356,7 @@ def check(cfg: StitchingConfig, nts=None, check_files: bool = False) -> list[str
     _check_coverage(cfg, p)
     _check_overrides(cfg, p)
     _check_realign(cfg, p)
+    _check_exclude(cfg, p)
     _check_overview(cfg, p, check_files)
     if nts is not None:
         _check_timeline(cfg, list(nts), p)
@@ -402,7 +429,8 @@ def check_layout(layout) -> list[str]:
             empty.append(t)
             continue
         anchors = set(layout.anchors_at(t))
-        corner_names = layout.config.corner_at(t)
+        # corner_at reads Override.at, which is raw; t here is compacted.
+        corner_names = layout.config.corner_at(layout.raw_t[t])
         edges = list(layout.pairs_at(t)) + [
             c
             for c in layout.corners_at(t)
@@ -450,7 +478,11 @@ def _check_pair_overrides(
 
     `edges`/`alive` default to `layout.pairs`/`layout.pair_alive`;
     `check_corner` passes `layout.corners`/`layout.corner_alive` instead --
-    same shape, same aliveness reasoning, different edge type.
+    same shape, same aliveness reasoning, different edge type. `alive` is
+    indexed by the compacted timeline, while `o.at` is raw (see
+    StitchingConfig.exclude_at), so each entry translates through
+    `layout.raw_to_t` -- a raw t excluded from the timeline entirely counts
+    as "not alive" here too, which is exactly right: nothing is alive there.
     """
     p: list[str] = []
     edges = layout.pairs if edges is None else edges
@@ -465,7 +497,11 @@ def _check_pair_overrides(
             if k is None:
                 p.append(f"{verb}: '{entry}' is not a discovered neighbour pair")
                 continue
-            dead = [t for t in o.at if not alive[t, k]]
+            dead = []
+            for t in o.at:
+                ct = layout.raw_to_t.get(t)
+                if ct is None or not alive[ct, k]:
+                    dead.append(t)
             if dead:
                 p.append(
                     f"{verb}: '{entry}' is not alive at t={_ranges(dead)}; "

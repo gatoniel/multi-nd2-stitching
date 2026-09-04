@@ -808,6 +808,61 @@ def test_stop_at_shrinks_the_task_count(project, capsys):
     assert "pending 7" in out  # 4 pair + 3 drift, vs. 15 for the full 8 timepoints
 
 
+# --- exclude_at -----------------------------------------------------------------
+def test_validate_reports_excluded_timepoints(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["exclude_at"] = [2, 3]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("validate", project, "--deep") == 0
+    out = capsys.readouterr().out
+    assert "excluded" in out and "2-3" in out and "canvas has 6 timepoint(s)" in out
+
+
+def test_validate_says_nothing_extra_without_exclude_at(project, capsys):
+    assert run("validate", project, "--deep") == 0
+    assert "excluded" not in capsys.readouterr().out
+
+
+def test_timeline_reports_excluded_timepoints(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["exclude_at"] = [2, 3]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("timeline", project) == 0
+    out = capsys.readouterr().out
+    assert "excluded" in out and "2-3" in out
+    assert "6" in out  # the compacted total
+
+
+def test_exclude_at_shrinks_the_task_count(project, capsys):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["exclude_at"] = [2, 3]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("status", project) == 0
+    out = capsys.readouterr().out
+    assert "pending 11" in out  # 6 pair + 5 drift, vs. 15 for the full 8 timepoints
+
+
+def test_exclude_at_compacts_the_blend_canvas(project, capsys, tmp_path):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["exclude_at"] = [2, 3]
+    project.write_text(yaml.safe_dump(cfg))
+    run("offsets", project, "--no-progress")
+    capsys.readouterr()
+    assert run("blend", project, "--output", tmp_path / "c.zarr", "--no-progress") == 0
+    out = capsys.readouterr().out
+    assert "canvas     (6," in out
+    assert "wrote      6 timepoint(s)" in out
+
+
+def test_exclude_at_shrinks_the_times_table(project, capsys, tmp_path):
+    cfg = yaml.safe_load(project.read_text())
+    cfg["exclude_at"] = [2, 3]
+    project.write_text(yaml.safe_dump(cfg))
+    assert run("times", project, "--out", tmp_path / "t.csv") == 0
+    out = capsys.readouterr().out
+    assert "timepoints 6" in out
+
+
 def test_timeline_at_resolves_a_global_timepoint(project, capsys):
     assert run("timeline", project, "--at", 5) == 0
     out = capsys.readouterr().out

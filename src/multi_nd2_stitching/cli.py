@@ -34,6 +34,18 @@ class Abort(Exception):
     pass
 
 
+def _ranges(ts) -> str:
+    """[1,2,3,7,9,10] -> '1-3, 7, 9-10'"""
+    ts = sorted(ts)
+    out, start, prev = [], ts[0], ts[0]
+    for t in [*ts[1:], None]:
+        if t != prev + 1:
+            out.append(str(start) if start == prev else f"{start}-{prev}")
+            start = t
+        prev = t
+    return ", ".join(out)
+
+
 def _report(problems, header: str) -> None:
     if problems:
         print(f"{header}: {len(problems)} problem(s)", file=sys.stderr)
@@ -84,11 +96,17 @@ def cmd_validate(args) -> int:
         f"{args.config}: OK  ({cfg.n_files} files, {len(cfg.positions)} positions, "
         f"{len(cfg.overrides)} override(s){extra}) [{tier}]"
     )
-    if layout is not None and layout.raw_nt > layout.nt:
-        print(
-            f"stopped    at t={layout.nt} ({layout.raw_nt - layout.nt} more "
-            "timepoint(s) in the files, not processed)"
-        )
+    if layout is not None:
+        if layout.raw_nt > layout.stop_nt:
+            print(
+                f"stopped    at t={layout.stop_nt} ({layout.raw_nt - layout.stop_nt} "
+                "more timepoint(s) in the files, not processed)"
+            )
+        if layout.excluded:
+            print(
+                f"excluded   {len(layout.excluded)} timepoint(s) (raw t): "
+                f"{_ranges(layout.excluded)}  -- canvas has {layout.nt} timepoint(s)"
+            )
     return 0
 
 
@@ -103,7 +121,9 @@ def cmd_timeline(args) -> int:
             )
             return 1
         file_i, local_t = layout.locate(args.at)
-        print(f"t={args.at}  ->  file {file_i}, timepoint {local_t}")
+        raw = layout.raw_t[args.at]
+        raw_note = f"  (raw t={raw})" if raw != args.at else ""
+        print(f"t={args.at}{raw_note}  ->  file {file_i}, timepoint {local_t}")
         print(f"           {Path(cfg.files[file_i]).name}")
         alive = layout.tiles_at(args.at)
         print(f"tiles      {len(alive)}: {', '.join(alive)}")
@@ -111,15 +131,15 @@ def cmd_timeline(args) -> int:
         return 0
 
     name_w = max(len(Path(f).name) for f in cfg.files)
-    span_w = len(f"{layout.nt - 1}") * 2 + 2
+    span_w = len(f"{layout.raw_nt - 1}") * 2 + 2
     print(
         f"{'file':>4}  {'timepoints':>{span_w}}  {'n':>5}  "
         f"{'tiles':>5}  {'anchors':<18}  {'name':<{name_w}}"
     )
     for i in range(cfg.n_files):
-        start = layout.file_start[i]
+        start = layout.file_start[i]  # raw t
         n = layout.nts[i]
-        if start >= layout.nt:
+        if start >= layout.stop_nt:
             # Entirely past stop_at: layout has no rows for this file at all,
             # so tiles_at(start) would index straight past the truncated mask.
             print(
@@ -133,17 +153,35 @@ def cmd_timeline(args) -> int:
             if hasattr(layout, "references_for_file")
             else cfg.references_for_file(i)
         )
-        alive = len(layout.tiles_at(start))
+        # The file's own first raw t may itself be excluded; walk forward to
+        # the first one that survived compaction, to look tiles_at() up.
+        first_kept = next(
+            (
+                raw
+                for raw in range(start, min(start + n, layout.stop_nt))
+                if raw in layout.raw_to_t
+            ),
+            None,
+        )
+        if first_kept is None:
+            alive_s = "-"
+        else:
+            alive_s = str(len(layout.tiles_at(layout.raw_to_t[first_kept])))
         print(
             f"{i:>4}  {f'{start}..{start + n - 1}':>{span_w}}  {n:>5}  "
-            f"{alive:>5}  {', '.join(anchors) or '-':<18}  "
+            f"{alive_s:>5}  {', '.join(anchors) or '-':<18}  "
             f"{Path(cfg.files[i]).name:<{name_w}}"
         )
-    print(f"{'':>4}  {'':>{span_w}}  {layout.nt:>5}  total")
-    if layout.raw_nt > layout.nt:
+    print(f"{'':>4}  {'':>{span_w}}  {layout.nt:>5}  total (kept)")
+    if layout.raw_nt > layout.stop_nt:
         print(
-            f"stopped    at t={layout.nt} ({layout.raw_nt - layout.nt} more "
-            "timepoint(s) in the files, not processed)"
+            f"stopped    at t={layout.stop_nt} ({layout.raw_nt - layout.stop_nt} "
+            "more timepoint(s) in the files, not processed)"
+        )
+    if layout.excluded:
+        print(
+            f"excluded   {len(layout.excluded)} timepoint(s) (raw t): "
+            f"{_ranges(layout.excluded)}"
         )
     return 0
 

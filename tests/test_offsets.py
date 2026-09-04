@@ -56,6 +56,43 @@ def test_time_task_only_for_anchors_with_a_predecessor(plan):
     assert p.time_tasks[0].t_from == 0 and p.time_tasks[0].t_to == 1
 
 
+# --- exclude_at: the drift chain jumps across an excluded stretch -------------
+def test_exclude_at_time_task_spans_the_gap_in_one_step(cfg_dict, tmp_path):
+    cfg_dict["exclude_at"] = [3, 4]
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    p = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+    steps = sorted(p.time_tasks, key=lambda t: t.t_to)
+    jump = next(t for t in steps if t.raw_gap > 1)
+    assert (jump.t_from, jump.t_to, jump.raw_gap) == (2, 3, 3)
+    assert "jump over 2 excluded" in jump.describe()
+
+
+def test_exclude_at_leaves_other_steps_at_a_gap_of_one(cfg_dict, tmp_path):
+    cfg_dict["exclude_at"] = [3, 4]
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    p = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+    steady = [t for t in p.time_tasks if t.raw_gap == 1]
+    assert steady and all("jump" not in t.describe() for t in steady)
+    assert len(p.time_tasks) == 7  # 8 kept timepoints, t=0 has nothing to drift from
+
+
+def test_exclude_at_shaped_peak_override_still_applies_by_raw_t(cfg_dict, tmp_path):
+    """shaped_peak (like every override) is authored in raw t; build_plan has
+    to translate the compacted loop index back before matching it."""
+    cfg_dict["exclude_at"] = [3, 4]
+    cfg_dict["overrides"] = [{"at": 6, "shaped_peak": ["tile_a"]}]  # raw t=6 -> t=4
+    files = stub_files(tmp_path, 2)
+    cfg_dict["files"] = files
+    meta = make_meta(n_files=2, nt=5, paths=files)
+    p = build_plan(build(cfg_dict, n_files=2, nt=5, paths=files), meta)
+    task = next(t for t in p.time_tasks if t.t_to == 4)
+    assert task.shaped_peak
+
+
 def test_dropped_tile_removes_its_tasks(cfg_dict, tmp_path):
     files = stub_files(tmp_path, 2)
     cfg_dict["files"] = files

@@ -125,6 +125,84 @@ def test_ragged_files(cfg_dict):
     assert lay.locate(10) == (2, 0)
 
 
+# --- exclude_at -----------------------------------------------------------------
+def test_exclude_at_absent_leaves_the_timeline_untouched(cfg_dict):
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.excluded == ()
+    assert lay.raw_t == tuple(range(10))
+    assert lay.nt == lay.stop_nt == lay.raw_nt == 10
+
+
+def test_exclude_at_shrinks_nt_and_compacts_raw_t(cfg_dict):
+    cfg_dict["exclude_at"] = [3, 4]
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.nt == 8
+    assert lay.stop_nt == lay.raw_nt == 10
+    assert lay.raw_t == (0, 1, 2, 5, 6, 7, 8, 9)
+    assert lay.excluded == (3, 4)
+
+
+def test_exclude_at_shapes_the_masks(cfg_dict):
+    cfg_dict["exclude_at"] = [3, 4]
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.tile_alive.shape[0] == 8
+    assert lay.is_anchor.shape[0] == 8
+    assert lay.pair_alive.shape[0] == 8
+
+
+def test_exclude_at_locate_skips_the_gap(cfg_dict):
+    """Compacted t=3 is raw t=5 -- file 1, local t=0 -- not raw t=3."""
+    cfg_dict["exclude_at"] = [3, 4]
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.locate(2) == (0, 2)
+    assert lay.locate(3) == (1, 0)
+
+
+def test_exclude_at_out_of_range_entries_are_a_noop(cfg_dict):
+    cfg_dict["exclude_at"] = [99999]
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.excluded == ()
+    assert lay.nt == 10
+
+
+def test_exclude_at_raw_to_t_omits_excluded_entries(cfg_dict):
+    cfg_dict["exclude_at"] = [3, 4]
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert 3 not in lay.raw_to_t and 4 not in lay.raw_to_t
+    assert lay.raw_to_t[5] == 3
+
+
+def test_exclude_at_beyond_stop_at_is_a_noop(cfg_dict):
+    """stop_at truncates first; an exclude past that boundary has nothing to
+    remove, same as an override there would."""
+    cfg_dict["stop_at"] = 5
+    cfg_dict["exclude_at"] = [7]
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.excluded == ()
+    assert lay.nt == 5
+
+
+def test_exclude_at_within_stop_at_still_compacts(cfg_dict):
+    cfg_dict["stop_at"] = 7
+    cfg_dict["exclude_at"] = [3, 4]
+    lay = build(cfg_dict, n_files=2, nt=5)
+    assert lay.stop_nt == 7
+    assert lay.excluded == (3, 4)
+    assert lay.nt == 5
+    assert lay.raw_t == (0, 1, 2, 5, 6)
+
+
+def test_exclude_at_check_layout_is_fine_across_the_gap(cfg_dict):
+    """The whole point: a tile alive before and after an excluded stretch
+    still routes fine, drifting straight across the gap."""
+    cfg_dict["exclude_at"] = [3, 4]
+    assert check_layout(build(cfg_dict, n_files=2, nt=5)) == []
+
+
+# build_plan's raw_gap/TimeTask behavior across an excluded stretch is
+# tested in test_offsets.py, alongside the rest of build_plan.
+
+
 # --- tiles --------------------------------------------------------------------
 def test_end_is_exclusive(cfg_dict):
     cfg_dict["files"] = [f"f{i}" for i in range(3)]

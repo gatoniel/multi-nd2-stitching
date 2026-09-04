@@ -126,15 +126,20 @@ def plan_placement(layout, t: int, seeded=None) -> Placement:
     if not alive:
         return Placement(t=t, steps=())
 
+    # Override.at is in raw global-timepoint numbering (see StitchingConfig
+    # .exclude_at), while `t` here is the compacted timeline layout.nt loops
+    # over -- translate before looking anything up against the config.
+    raw_t = layout.raw_t[t]
+
     # shaped_peak names either a bare tile (a drift step) or an "a,b" pair (a
     # neighbour edge, either order) -- see StitchingConfig.shaped_peak_at.
-    shaped_names = layout.config.shaped_peak_at(t)
+    shaped_names = layout.config.shaped_peak_at(raw_t)
 
     def pair_shaped(a: str, b: str) -> bool:
         return f"{a},{b}" in shaped_names or f"{b},{a}" in shaped_names
 
     # corner names an "a,b" pair too, either order -- see corner_at.
-    corner_names = layout.config.corner_at(t)
+    corner_names = layout.config.corner_at(raw_t)
 
     def corner_enabled(a: str, b: str) -> bool:
         return f"{a},{b}" in corner_names or f"{b},{a}" in corner_names
